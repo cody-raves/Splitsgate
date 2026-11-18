@@ -1,0 +1,29 @@
+# Generated build trees
+build/
+out/
+.vs/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Compiled artifacts
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+*.obj
+
+# Runtime and diagnostic data
+splitgate-personal-bests.tsv
+race_profile.txt
+profile-probe.txt
+restart-probe.txt
+*.log
+
+# Editor and operating-system files
+.vscode/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
