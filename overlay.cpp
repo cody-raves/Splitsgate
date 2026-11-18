@@ -1,10 +1,13 @@
 #include <Windows.h>
 #include <d3d11.h>
+#include <d3d12.h>
 #include <dxgi.h>
+#include <dxgi1_4.h>
 #include <wincodec.h>
 #include <atomic>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cmath>
@@ -26,6 +29,7 @@
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
 
 using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
+using ExecuteCommandListsFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using RestartRaceFn = void(__fastcall*)(void*);
 using RestartVisibilityFn = uint8_t(__fastcall*)(void*);
 using DifficultySelectedFn = void(__fastcall*)(void*, void*);
@@ -33,6 +37,20 @@ using MapSelectedExecFn = void(__fastcall*)(void*, void*, void*);
 using MapSelectedFn = void(__fastcall*)(void*, void*);
 
 static PresentFn g_original_present = nullptr;
+static std::atomic_int g_active_hook_calls = 0;
+static ExecuteCommandListsFn g_original_execute_command_lists = nullptr;
+static std::atomic<ID3D12CommandQueue*> g_arena_command_queue = nullptr;
+static ID3D12Device* g_arena_d3d12_device = nullptr;
+static ID3D12CommandAllocator* g_arena_copy_allocator = nullptr;
+static ID3D12GraphicsCommandList* g_arena_copy_list = nullptr;
+static ID3D12Resource* g_arena_readback = nullptr;
+static ID3D12Fence* g_arena_copy_fence = nullptr;
+static HANDLE g_arena_copy_event = nullptr;
+static UINT64 g_arena_copy_fence_value = 0;
+static UINT g_arena_readback_width = 0;
+static UINT g_arena_readback_height = 0;
+static UINT g_arena_readback_pitch = 0;
+static DXGI_FORMAT g_arena_readback_format = DXGI_FORMAT_UNKNOWN;
 static RestartRaceFn g_original_restart_race = nullptr;
 static RestartVisibilityFn g_original_restart_visibility = nullptr;
 static DifficultySelectedFn g_original_difficulty_selected = nullptr;
@@ -90,6 +108,14 @@ static std::string g_map_name = "RACE";
 static std::string g_difficulty = "READY";
 static std::atomic_bool g_live_profile_seen = false;
 static std::chrono::steady_clock::time_point g_last_profile_read{};
+static bool g_arena_reloaded = false;
+static ID3D11Texture2D* g_arena_hud_probe = nullptr;
+static std::chrono::steady_clock::time_point g_last_arena_hud_probe{};
+static std::atomic<double> g_arena_clock = 0.0;
+static std::atomic_int g_arena_count = 0;
+static std::atomic_int g_arena_total = 0;
+static std::atomic_bool g_arena_hud_valid = false;
+static bool g_arena_pixels_r10 = false;
 
 // PortalWars-Win64-Shipping.exe 2026 race pause-menu handler. Keeping this as
 // an RVA makes it independent of ASLR; the hook is also a useful guard against
@@ -641,6 +667,12 @@ static bool readable_address(uintptr_t address, size_t size) {
 }
 
 static bool race_sample(uintptr_t race, int& count, double& clock) {
+    if (g_arena_reloaded) {
+        if (!g_arena_hud_valid.load(std::memory_order_acquire)) return false;
+        count = g_arena_count.load(std::memory_order_acquire);
+        clock = g_arena_clock.load(std::memory_order_acquire);
+        return count >= 0 && count <= 100 && std::isfinite(clock) && clock >= 0.0 && clock < 3600.5;
+    }
     if (!readable_address(race + COUNT_OFFSET, CLOCK_OFFSET - COUNT_OFFSET + sizeof(double))) return false;
     std::memcpy(&count, reinterpret_cast<void*>(race + COUNT_OFFSET), sizeof(count));
     std::memcpy(&clock, reinterpret_cast<void*>(race + CLOCK_OFFSET), sizeof(clock));
@@ -648,6 +680,7 @@ static bool race_sample(uintptr_t race, int& count, double& clock) {
 }
 
 static int race_total_balls(uintptr_t race) {
+    if (g_arena_reloaded) return g_arena_total.load(std::memory_order_acquire);
     if (!readable_address(race + BALL_ARRAY_OWNER_OFFSET, sizeof(uintptr_t))) return 0;
     uintptr_t owner = 0;
     std::memcpy(&owner, reinterpret_cast<void*>(race + BALL_ARRAY_OWNER_OFFSET), sizeof(owner));
@@ -778,6 +811,383 @@ static bool initialize_imgui(IDXGISwapChain* swap_chain) {
         g_game_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(overlay_wndproc)));
     if (!g_original_wndproc) return false;
     return true;
+}
+
+struct HudGlyph {
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+    int area = 0;
+};
+
+enum class HudInk { dark, yellow, white };
+
+static constexpr uint16_t k_arena_digit_templates[10][16] = {
+    {0x7FFC, 0xFFFE, 0xF01F, 0xC007, 0xC007, 0xC007, 0xC007, 0xC007, 0xC007, 0xC007, 0xC007, 0xC007, 0xC007, 0xE00F, 0xFFFE, 0x7FFE},
+    {0x07C0, 0x07FF, 0x07FF, 0x07FF, 0x07C0, 0x07C0, 0x07C0, 0x07C0, 0x07C0, 0x07C0, 0x07C0, 0x07C0, 0x07C0, 0xFFFF, 0xFFFF, 0xFFFF},
+    {0x7FFE, 0xFFFE, 0xFFFE, 0xE000, 0xC000, 0xC000, 0xE000, 0xF000, 0x7F00, 0x1F00, 0x0FC0, 0x03F0, 0x00FC, 0xFFFE, 0xFFFF, 0xFFFF},
+    {0xFFFF, 0xFFFF, 0xFFFE, 0x7C00, 0x3F00, 0x0F80, 0x07C0, 0x7FE0, 0xFFE0, 0xE000, 0xE000, 0xC000, 0xE000, 0xFFFF, 0xFFFF, 0xFFFF},
+    {0x0380, 0x03C0, 0x01E0, 0x00E0, 0x0070, 0x0070, 0x1C78, 0x1C3C, 0x1C0E, 0x1C0F, 0xFFFF, 0xFFFF, 0xFFFF, 0x1C00, 0x1C00, 0x1C00},
+    {0xFFFF, 0xFFFF, 0xFFFF, 0x0007, 0x0007, 0x0007, 0x3FFF, 0xFFFF, 0xFFFF, 0xC000, 0xC000, 0xC000, 0xC000, 0xFFFF, 0xFFFF, 0xFFFF},
+    {0x1C00, 0x1E00, 0x0F80, 0x07C0, 0x03C0, 0x01F0, 0x0078, 0xFFFC, 0xFFFF, 0xE00F, 0xC00F, 0xC00F, 0xC00F, 0xE01F, 0xFFFE, 0xFFFE},
+    {0xFFFF, 0xFFFF, 0xFFFF, 0xE000, 0xF000, 0xF800, 0x7800, 0x3C00, 0x1E00, 0x0F00, 0x0F80, 0x0780, 0x03C0, 0x03E0, 0x01E0, 0x01F0},
+    {0x7FFE, 0xFFFE, 0xFFFF, 0xF00F, 0xE00F, 0xE00F, 0xF00F, 0xFFFE, 0xFFFF, 0xE00F, 0xE007, 0xE007, 0xE007, 0xF00F, 0xFFFF, 0xFFFF},
+    {0x7FFF, 0x7FFF, 0xF807, 0xF003, 0xF003, 0xF003, 0xF007, 0xFFFF, 0x3FFF, 0x1E00, 0x0F80, 0x03C0, 0x03E0, 0x01F0, 0x0078, 0x0038},
+};
+
+static bool hud_ink(const unsigned char* pixel, HudInk ink) {
+    int c0 = pixel[0], c1 = pixel[1], c2 = pixel[2];
+    if (g_arena_pixels_r10) {
+        uint32_t packed = 0;
+        std::memcpy(&packed, pixel, sizeof(packed));
+        c0 = static_cast<int>((packed & 0x3ffu) * 255u / 1023u);
+        c1 = static_cast<int>(((packed >> 10) & 0x3ffu) * 255u / 1023u);
+        c2 = static_cast<int>(((packed >> 20) & 0x3ffu) * 255u / 1023u);
+    }
+    const int high = std::max({c0, c1, c2});
+    const int low = std::min({c0, c1, c2});
+    if (ink == HudInk::dark) return (c0 + c1 + c2) / 3 < 190;
+    if (ink == HudInk::white) return low > 155 && high - low < 72;
+    return (c0 > 155 && c1 > 115 && c2 < 170) ||
+           (c2 > 155 && c1 > 115 && c0 < 170);
+}
+
+static std::vector<HudGlyph> find_hud_glyphs(
+    const unsigned char* pixels, UINT row_pitch, int width, int height,
+    int left, int top, int right, int bottom, HudInk ink) {
+    left = std::clamp(left, 0, width);
+    right = std::clamp(right, left, width);
+    top = std::clamp(top, 0, height);
+    bottom = std::clamp(bottom, top, height);
+    const int scan_width = right - left;
+    const int scan_height = bottom - top;
+    std::vector<uint8_t> mask(static_cast<size_t>(scan_width) * scan_height, 0);
+    for (int y = 0; y < scan_height; ++y) {
+        const auto* row = pixels + (top + y) * row_pitch;
+        for (int x = 0; x < scan_width; ++x) {
+            mask[static_cast<size_t>(y) * scan_width + x] = hud_ink(row + (left + x) * 4, ink) ? 1 : 0;
+        }
+    }
+    std::vector<HudGlyph> result;
+    std::vector<int> stack;
+    for (int sy = 0; sy < scan_height; ++sy) {
+        for (int sx = 0; sx < scan_width; ++sx) {
+            const int seed = sy * scan_width + sx;
+            if (!mask[seed]) continue;
+            mask[seed] = 0;
+            stack.clear();
+            stack.push_back(seed);
+            HudGlyph glyph{sx, sy, sx + 1, sy + 1, 0};
+            while (!stack.empty()) {
+                const int item = stack.back();
+                stack.pop_back();
+                const int x = item % scan_width;
+                const int y = item / scan_width;
+                ++glyph.area;
+                glyph.left = std::min(glyph.left, x);
+                glyph.top = std::min(glyph.top, y);
+                glyph.right = std::max(glyph.right, x + 1);
+                glyph.bottom = std::max(glyph.bottom, y + 1);
+                const int nx[] = {x - 1, x + 1, x, x};
+                const int ny[] = {y, y, y - 1, y + 1};
+                for (int i = 0; i < 4; ++i) {
+                    if (nx[i] < 0 || nx[i] >= scan_width || ny[i] < 0 || ny[i] >= scan_height) continue;
+                    const int next = ny[i] * scan_width + nx[i];
+                    if (!mask[next]) continue;
+                    mask[next] = 0;
+                    stack.push_back(next);
+                }
+            }
+            glyph.left += left;
+            glyph.right += left;
+            glyph.top += top;
+            glyph.bottom += top;
+            const int glyph_width = glyph.right - glyph.left;
+            const int glyph_height = glyph.bottom - glyph.top;
+            if (glyph_height >= std::max(8, scan_height / 5) &&
+                glyph_width >= 4 && glyph_width <= std::max(12, width * 3 / 20) && glyph.area >= 30) {
+                result.push_back(glyph);
+            }
+        }
+    }
+    std::sort(result.begin(), result.end(), [](const HudGlyph& a, const HudGlyph& b) { return a.left < b.left; });
+    return result;
+}
+
+static int read_hud_digit(const unsigned char* pixels, UINT row_pitch, const HudGlyph& glyph, HudInk ink) {
+    const int source_width = glyph.right - glyph.left;
+    const int source_height = glyph.bottom - glyph.top;
+    if (source_width <= 0 || source_height <= 0) return -1;
+    uint16_t rows[16]{};
+    for (int y = 0; y < 16; ++y) {
+        const int source_y = glyph.top + std::min(source_height - 1, y * source_height / 16);
+        const auto* row = pixels + source_y * row_pitch;
+        for (int x = 0; x < 16; ++x) {
+            const int source_x = glyph.left + std::min(source_width - 1, x * source_width / 16);
+            if (hud_ink(row + source_x * 4, ink)) rows[y] |= static_cast<uint16_t>(1u << x);
+        }
+    }
+    int best_digit = -1;
+    int best_score = 10000;
+    int ink_pixels = 0;
+    for (uint16_t row : rows) ink_pixels += std::popcount(static_cast<unsigned>(row));
+    for (int digit = 0; digit < 10; ++digit) {
+        int score = 0;
+        for (int y = 0; y < 16; ++y) score += std::popcount(static_cast<unsigned>(rows[y] ^ k_arena_digit_templates[digit][y]));
+        if (score < best_score) {
+            best_score = score;
+            best_digit = digit;
+        }
+    }
+    // Arena's 9 has the same falling diagonal as 7, but also contains the
+    // closed upper bowl. The supplied screenshots covered every other digit;
+    // density cleanly separates these two at any resolution after normalization.
+    if (best_digit == 7 && ink_pixels >= 115) best_digit = 9;
+    return best_score <= 112 ? best_digit : -1;
+}
+
+static bool parse_arena_hud_pixels(const unsigned char* pixels, UINT row_pitch, int width, int height) {
+    auto timer_glyphs = find_hud_glyphs(pixels, row_pitch, width, height,
+        width / 12, 0, width * 11 / 12, height * 38 / 100, HudInk::dark);
+    bool timer_valid = timer_glyphs.size() == 6;
+    int timer_digits[6]{};
+    if (timer_valid) {
+        for (int i = 0; i < 6; ++i) {
+            timer_digits[i] = read_hud_digit(pixels, row_pitch, timer_glyphs[i], HudInk::dark);
+            if (timer_digits[i] < 0) timer_valid = false;
+        }
+    }
+    if (timer_valid) {
+        const int minutes = timer_digits[0] * 10 + timer_digits[1];
+        const int seconds = timer_digits[2] * 10 + timer_digits[3];
+        const int hundredths = timer_digits[4] * 10 + timer_digits[5];
+        if (minutes < 60 && seconds < 60) {
+            g_arena_clock.store(minutes * 60.0 + seconds + hundredths / 100.0, std::memory_order_release);
+        } else {
+            timer_valid = false;
+        }
+    }
+    const int counter_top = height * 52 / 100;
+    auto yellow = find_hud_glyphs(pixels, row_pitch, width, height,
+        width / 5, counter_top, width / 2, height, HudInk::yellow);
+    auto white = find_hud_glyphs(pixels, row_pitch, width, height,
+        width * 54 / 100, counter_top, width * 9 / 10, height, HudInk::white);
+    int current = 0;
+    bool current_valid = !yellow.empty() && yellow.size() <= 2;
+    for (const HudGlyph& glyph : yellow) {
+        const int digit = read_hud_digit(pixels, row_pitch, glyph, HudInk::yellow);
+        if (digit < 0) { current_valid = false; break; }
+        current = current * 10 + digit;
+    }
+    int total = 0;
+    bool total_valid = !white.empty() && white.size() <= 2;
+    for (const HudGlyph& glyph : white) {
+        const int digit = read_hud_digit(pixels, row_pitch, glyph, HudInk::white);
+        if (digit < 0) { total_valid = false; break; }
+        total = total * 10 + digit;
+    }
+    if (current_valid && total_valid && current >= 0 && current <= total && total >= 3 && total <= 100) {
+        g_arena_count.store(current, std::memory_order_release);
+        g_arena_total.store(total, std::memory_order_release);
+    }
+    g_arena_hud_valid.store(timer_valid, std::memory_order_release);
+    return timer_valid;
+}
+
+static bool read_arena_hud(IDXGISwapChain* swap_chain) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_last_arena_hud_probe < std::chrono::milliseconds(15)) {
+        return g_arena_hud_valid.load(std::memory_order_acquire);
+    }
+    g_last_arena_hud_probe = now;
+    ID3D11Texture2D* back_buffer = nullptr;
+    if (FAILED(swap_chain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back_buffer)))) return false;
+    D3D11_TEXTURE2D_DESC source{};
+    back_buffer->GetDesc(&source);
+    const UINT crop_left = static_cast<UINT>(source.Width * 0.455f);
+    const UINT crop_top = static_cast<UINT>(source.Height * 0.065f);
+    const UINT crop_width = static_cast<UINT>(source.Width * 0.090f);
+    const UINT crop_height = static_cast<UINT>(source.Height * 0.090f);
+    if (crop_width < 140 || crop_height < 75) {
+        back_buffer->Release();
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC existing{};
+    if (g_arena_hud_probe) g_arena_hud_probe->GetDesc(&existing);
+    if (!g_arena_hud_probe || existing.Width != crop_width || existing.Height != crop_height || existing.Format != source.Format) {
+        if (g_arena_hud_probe) { g_arena_hud_probe->Release(); g_arena_hud_probe = nullptr; }
+        D3D11_TEXTURE2D_DESC desc = source;
+        desc.Width = crop_width;
+        desc.Height = crop_height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.MiscFlags = 0;
+        if (FAILED(g_device->CreateTexture2D(&desc, nullptr, &g_arena_hud_probe))) {
+            back_buffer->Release();
+            return false;
+        }
+    }
+    D3D11_BOX box{crop_left, crop_top, 0, crop_left + crop_width, crop_top + crop_height, 1};
+    g_context->CopySubresourceRegion(g_arena_hud_probe, 0, 0, 0, 0, back_buffer, 0, &box);
+    back_buffer->Release();
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(g_context->Map(g_arena_hud_probe, 0, D3D11_MAP_READ, 0, &mapped))) return false;
+
+    const bool valid = parse_arena_hud_pixels(static_cast<const unsigned char*>(mapped.pData), mapped.RowPitch,
+        static_cast<int>(crop_width), static_cast<int>(crop_height));
+    g_context->Unmap(g_arena_hud_probe, 0);
+    return valid;
+}
+
+static void __stdcall hooked_execute_command_lists(
+    ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
+    g_active_hook_calls.fetch_add(1, std::memory_order_acq_rel);
+    ID3D12CommandQueue* expected = nullptr;
+    if (g_arena_reloaded && g_arena_command_queue.compare_exchange_strong(expected, queue, std::memory_order_acq_rel)) {
+        queue->AddRef();
+    }
+    g_original_execute_command_lists(queue, count, lists);
+    g_active_hook_calls.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+static void release_arena_d3d12_capture() {
+    if (g_arena_readback) { g_arena_readback->Release(); g_arena_readback = nullptr; }
+    if (g_arena_copy_list) { g_arena_copy_list->Release(); g_arena_copy_list = nullptr; }
+    if (g_arena_copy_allocator) { g_arena_copy_allocator->Release(); g_arena_copy_allocator = nullptr; }
+    if (g_arena_copy_fence) { g_arena_copy_fence->Release(); g_arena_copy_fence = nullptr; }
+    if (g_arena_copy_event) { CloseHandle(g_arena_copy_event); g_arena_copy_event = nullptr; }
+    if (g_arena_d3d12_device) { g_arena_d3d12_device->Release(); g_arena_d3d12_device = nullptr; }
+    g_arena_readback_width = 0;
+    g_arena_readback_height = 0;
+    g_arena_readback_pitch = 0;
+    g_arena_readback_format = DXGI_FORMAT_UNKNOWN;
+}
+
+static bool read_arena_hud_d3d12(IDXGISwapChain* swap_chain) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_last_arena_hud_probe < std::chrono::milliseconds(15)) {
+        return g_arena_hud_valid.load(std::memory_order_acquire);
+    }
+    g_last_arena_hud_probe = now;
+    if (!g_arena_d3d12_device) {
+        if (FAILED(swap_chain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&g_arena_d3d12_device)))) return false;
+        if (!g_arena_command_queue.load(std::memory_order_acquire)) {
+            D3D12_COMMAND_QUEUE_DESC queue_desc{};
+            queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            ID3D12CommandQueue* capture_queue = nullptr;
+            if (FAILED(g_arena_d3d12_device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&capture_queue)))) return false;
+            ID3D12CommandQueue* expected = nullptr;
+            if (!g_arena_command_queue.compare_exchange_strong(expected, capture_queue, std::memory_order_acq_rel)) {
+                capture_queue->Release();
+            }
+        }
+        if (FAILED(g_arena_d3d12_device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_arena_copy_allocator)))) return false;
+        if (FAILED(g_arena_d3d12_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                g_arena_copy_allocator, nullptr, IID_PPV_ARGS(&g_arena_copy_list)))) return false;
+        if (FAILED(g_arena_copy_list->Close())) return false;
+        if (FAILED(g_arena_d3d12_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_arena_copy_fence)))) return false;
+        g_arena_copy_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!g_arena_copy_event) return false;
+    }
+    ID3D12CommandQueue* queue = g_arena_command_queue.load(std::memory_order_acquire);
+    if (!queue) return false;
+    IDXGISwapChain3* swap_chain3 = nullptr;
+    if (FAILED(swap_chain->QueryInterface(IID_PPV_ARGS(&swap_chain3)))) return false;
+    const UINT buffer_index = swap_chain3->GetCurrentBackBufferIndex();
+    swap_chain3->Release();
+    ID3D12Resource* back_buffer = nullptr;
+    if (FAILED(swap_chain->GetBuffer(buffer_index, IID_PPV_ARGS(&back_buffer)))) return false;
+    const D3D12_RESOURCE_DESC source = back_buffer->GetDesc();
+    const UINT crop_left = static_cast<UINT>(source.Width * 0.455);
+    const UINT crop_top = static_cast<UINT>(source.Height * 0.065);
+    const UINT crop_width = static_cast<UINT>(source.Width * 0.090);
+    const UINT crop_height = static_cast<UINT>(source.Height * 0.090);
+    if (crop_width < 140 || crop_height < 75 ||
+        (source.Format != DXGI_FORMAT_R8G8B8A8_UNORM && source.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+         source.Format != DXGI_FORMAT_B8G8R8A8_UNORM && source.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB &&
+         source.Format != DXGI_FORMAT_R10G10B10A2_UNORM)) {
+        back_buffer->Release();
+        return false;
+    }
+    const UINT row_pitch = (crop_width * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+        ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    if (!g_arena_readback || g_arena_readback_width != crop_width || g_arena_readback_height != crop_height ||
+        g_arena_readback_format != source.Format) {
+        if (g_arena_readback) { g_arena_readback->Release(); g_arena_readback = nullptr; }
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = static_cast<UINT64>(row_pitch) * crop_height;
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_arena_d3d12_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_arena_readback)))) {
+            back_buffer->Release();
+            return false;
+        }
+        g_arena_readback_width = crop_width;
+        g_arena_readback_height = crop_height;
+        g_arena_readback_pitch = row_pitch;
+        g_arena_readback_format = source.Format;
+    }
+    if (FAILED(g_arena_copy_allocator->Reset()) || FAILED(g_arena_copy_list->Reset(g_arena_copy_allocator, nullptr))) {
+        back_buffer->Release();
+        return false;
+    }
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = back_buffer;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    g_arena_copy_list->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = g_arena_readback;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint.Footprint.Format = source.Format;
+    destination.PlacedFootprint.Footprint.Width = crop_width;
+    destination.PlacedFootprint.Footprint.Height = crop_height;
+    destination.PlacedFootprint.Footprint.Depth = 1;
+    destination.PlacedFootprint.Footprint.RowPitch = row_pitch;
+    D3D12_TEXTURE_COPY_LOCATION source_location{};
+    source_location.pResource = back_buffer;
+    source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    source_location.SubresourceIndex = 0;
+    D3D12_BOX source_box{crop_left, crop_top, 0, crop_left + crop_width, crop_top + crop_height, 1};
+    g_arena_copy_list->CopyTextureRegion(&destination, 0, 0, 0, &source_location, &source_box);
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    g_arena_copy_list->ResourceBarrier(1, &barrier);
+    const HRESULT close_result = g_arena_copy_list->Close();
+    back_buffer->Release();
+    if (FAILED(close_result)) return false;
+    ID3D12CommandList* lists[] = {g_arena_copy_list};
+    queue->ExecuteCommandLists(1, lists);
+    const UINT64 fence_value = ++g_arena_copy_fence_value;
+    if (FAILED(queue->Signal(g_arena_copy_fence, fence_value))) return false;
+    if (g_arena_copy_fence->GetCompletedValue() < fence_value) {
+        if (FAILED(g_arena_copy_fence->SetEventOnCompletion(fence_value, g_arena_copy_event))) return false;
+        if (WaitForSingleObject(g_arena_copy_event, 1000) != WAIT_OBJECT_0) return false;
+    }
+    void* mapped = nullptr;
+    D3D12_RANGE read_range{0, static_cast<SIZE_T>(row_pitch) * crop_height};
+    if (FAILED(g_arena_readback->Map(0, &read_range, &mapped))) return false;
+    g_arena_pixels_r10 = source.Format == DXGI_FORMAT_R10G10B10A2_UNORM;
+    const bool valid = parse_arena_hud_pixels(static_cast<const unsigned char*>(mapped), row_pitch,
+        static_cast<int>(crop_width), static_cast<int>(crop_height));
+    D3D12_RANGE written_range{0, 0};
+    g_arena_readback->Unmap(0, &written_range);
+    return valid;
 }
 
 static int detect_total_balls(IDXGISwapChain* swap_chain) {
@@ -1135,8 +1545,8 @@ static void draw_proof_of_concept() {
             g_splits.fill(0.0);
             for (auto& split : g_sampled_splits) split.store(0.0, std::memory_order_release);
             g_last_count = count;
-            g_race_running = count > 0;
-            g_prestart_gate = count == 0;
+            g_race_running = g_arena_reloaded || count > 0;
+            g_prestart_gate = !g_arena_reloaded && count == 0;
             g_prestart_saw_zero_count = count == 0;
             g_prestart_ignore_until = state_now;
             g_waiting_for_start_reset = count == 0 && clock > 0.75;
@@ -1341,6 +1751,14 @@ static void draw_proof_of_concept() {
 }
 
 static HRESULT __stdcall hooked_present(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
+    struct PresentCallGuard {
+        PresentCallGuard() { g_active_hook_calls.fetch_add(1, std::memory_order_acq_rel); }
+        ~PresentCallGuard() { g_active_hook_calls.fetch_sub(1, std::memory_order_acq_rel); }
+    } guard;
+    if (g_arena_reloaded) {
+        read_arena_hud_d3d12(swap_chain);
+        return g_original_present(swap_chain, sync_interval, flags);
+    }
     if (!g_imgui_ready.load()) {
         g_imgui_ready.store(initialize_imgui(swap_chain));
     }
@@ -1439,20 +1857,49 @@ static void* find_present_address() {
     return present;
 }
 
+static void* find_execute_command_lists_address() {
+    ID3D12Device* device = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
+    void* execute = nullptr;
+    if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) {
+        D3D12_COMMAND_QUEUE_DESC desc{};
+        desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)))) {
+            void** vtable = *reinterpret_cast<void***>(queue);
+            execute = vtable[10];
+        }
+    }
+    if (queue) queue->Release();
+    if (device) device->Release();
+    return execute;
+}
+
 static DWORD WINAPI overlay_thread(void*) {
     while (!GetModuleHandleW(L"d3d11.dll")) Sleep(100);
     void* present = find_present_address();
     if (!present || MH_Initialize() != MH_OK) return 1;
     if (MH_CreateHook(present, &hooked_present, reinterpret_cast<void**>(&g_original_present)) != MH_OK) return 2;
-    const uintptr_t image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    void* restart_handler = reinterpret_cast<void*>(image + RESTART_RACE_HANDLER_RVA);
-    if (MH_CreateHook(restart_handler, &hooked_restart_race, reinterpret_cast<void**>(&g_original_restart_race)) != MH_OK) return 3;
-    void* visibility_handler = reinterpret_cast<void*>(image + RESTART_VISIBILITY_HANDLER_RVA);
-    if (MH_CreateHook(visibility_handler, &hooked_restart_visibility, reinterpret_cast<void**>(&g_original_restart_visibility)) != MH_OK) return 4;
-    void* difficulty_handler = reinterpret_cast<void*>(image + DIFFICULTY_SELECTED_RVA);
-    if (MH_CreateHook(difficulty_handler, &hooked_difficulty_selected, reinterpret_cast<void**>(&g_original_difficulty_selected)) != MH_OK) return 5;
-    void* map_selected_exec = reinterpret_cast<void*>(image + MAP_SELECTED_EXEC_RVA);
-    if (MH_CreateHook(map_selected_exec, &hooked_map_selected_exec, reinterpret_cast<void**>(&g_original_map_selected_exec)) != MH_OK) return 6;
+    if (g_arena_reloaded) {
+        void* execute_command_lists = find_execute_command_lists_address();
+        if (!execute_command_lists || MH_CreateHook(execute_command_lists, &hooked_execute_command_lists,
+                reinterpret_cast<void**>(&g_original_execute_command_lists)) != MH_OK) return 8;
+    }
+    if (!g_arena_reloaded) {
+        const uintptr_t image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        void* restart_handler = reinterpret_cast<void*>(image + RESTART_RACE_HANDLER_RVA);
+        if (MH_CreateHook(restart_handler, &hooked_restart_race, reinterpret_cast<void**>(&g_original_restart_race)) != MH_OK) return 3;
+        void* visibility_handler = reinterpret_cast<void*>(image + RESTART_VISIBILITY_HANDLER_RVA);
+        if (MH_CreateHook(visibility_handler, &hooked_restart_visibility, reinterpret_cast<void**>(&g_original_restart_visibility)) != MH_OK) return 4;
+        void* difficulty_handler = reinterpret_cast<void*>(image + DIFFICULTY_SELECTED_RVA);
+        if (MH_CreateHook(difficulty_handler, &hooked_difficulty_selected, reinterpret_cast<void**>(&g_original_difficulty_selected)) != MH_OK) return 5;
+        void* map_selected_exec = reinterpret_cast<void*>(image + MAP_SELECTED_EXEC_RVA);
+        if (MH_CreateHook(map_selected_exec, &hooked_map_selected_exec, reinterpret_cast<void**>(&g_original_map_selected_exec)) != MH_OK) return 6;
+    } else {
+        g_race_object.store(1, std::memory_order_release);
+        g_map_name = "ARENA RELOADED";
+        g_difficulty = "RACE";
+        g_live_profile_seen.store(true, std::memory_order_release);
+    }
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) return 7;
 
     int sampled_count = -1;
@@ -1478,7 +1925,7 @@ static DWORD WINAPI overlay_thread(void*) {
         }
 
         const auto now = std::chrono::steady_clock::now();
-        const bool restart_down = g_restart_key_down.load(std::memory_order_acquire);
+        const bool restart_down = !g_arena_reloaded && g_restart_key_down.load(std::memory_order_acquire);
         if (restart_down) {
             if (!restart_was_down) restart_hold_started = now;
             restart_was_down = true;
@@ -1497,7 +1944,7 @@ static DWORD WINAPI overlay_thread(void*) {
         // Lobby objects can retain the just-exited race with a perfectly valid
         // frozen clock. Do not let the background locator re-adopt that stale
         // object after the render thread has cleared it for the lobby.
-        if ((!valid || g_finished) &&
+        if (!g_arena_reloaded && (!valid || g_finished) &&
             !g_in_race_lobby.load(std::memory_order_acquire) &&
             now >= next_locator_check) {
             const uintptr_t located = locate_race();
@@ -1516,6 +1963,10 @@ static DWORD WINAPI overlay_thread(void*) {
         Sleep(1);
     }
     MH_DisableHook(MH_ALL_HOOKS);
+    // A Present callback can already be executing on the render thread when
+    // END requests a hot unload. Wait for it to leave this DLL before freeing
+    // the D3D resources or the module itself.
+    for (int i = 0; i < 2000 && g_active_hook_calls.load(std::memory_order_acquire) > 0; ++i) Sleep(1);
     MH_Uninitialize();
     if (g_game_window && g_original_wndproc) {
         SetWindowLongPtrW(g_game_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_original_wndproc));
@@ -1523,6 +1974,9 @@ static DWORD WINAPI overlay_thread(void*) {
     }
     if (g_logo_texture) { g_logo_texture->Release(); g_logo_texture = nullptr; }
     if (g_lobby_probe) { g_lobby_probe->Release(); g_lobby_probe = nullptr; }
+    if (g_arena_hud_probe) { g_arena_hud_probe->Release(); g_arena_hud_probe = nullptr; }
+    release_arena_d3d12_capture();
+    if (ID3D12CommandQueue* queue = g_arena_command_queue.exchange(nullptr, std::memory_order_acq_rel)) queue->Release();
     Sleep(100);
     FreeLibraryAndExitThread(g_module, 0);
 }
@@ -1530,6 +1984,12 @@ static DWORD WINAPI overlay_thread(void*) {
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_module = module;
+        wchar_t executable[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, executable, MAX_PATH)) {
+            const wchar_t* name = wcsrchr(executable, L'\\');
+            name = name ? name + 1 : executable;
+            g_arena_reloaded = _wcsicmp(name, L"PortalWars2-Win64-Shipping.exe") == 0;
+        }
         DisableThreadLibraryCalls(module);
         if (HANDLE thread = CreateThread(nullptr, 0, overlay_thread, nullptr, 0, nullptr)) CloseHandle(thread);
     }

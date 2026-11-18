@@ -19,7 +19,7 @@ target_compile_definitions(imgui PRIVATE UNICODE _UNICODE)
 
 add_library(SplitgateSplitsOverlay SHARED overlay.cpp)
 target_include_directories(SplitgateSplitsOverlay PRIVATE vendor/imgui vendor/imgui/backends vendor/minhook/include)
-target_link_libraries(SplitgateSplitsOverlay PRIVATE imgui minhook d3d11 dxgi dwmapi windowscodecs)
+target_link_libraries(SplitgateSplitsOverlay PRIVATE imgui minhook d3d11 d3d12 dxgi dwmapi windowscodecs)
 target_compile_definitions(SplitgateSplitsOverlay PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 add_custom_command(TARGET SplitgateSplitsOverlay POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:SplitgateSplitsOverlay>/assets"
