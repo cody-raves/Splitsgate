@@ -31,3 +31,9 @@ add_custom_command(TARGET SplitgateSplitsOverlay POST_BUILD
 add_executable(SplitgateOverlayLoader loader.cpp)
 target_compile_definitions(SplitgateOverlayLoader PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
+add_executable(ArenaRaceProbe arena_probe.cpp)
+target_compile_definitions(ArenaRaceProbe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+
+add_executable(ArenaDllLoader arena_dll_loader.cpp)
+target_compile_definitions(ArenaDllLoader PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+

@@ -1,0 +1,48 @@
+{
+  "game": "Splitgate 2: Arena Reloaded",
+  "observed_build": "3.1-643074",
+  "executable": "PortalWars2-Win64-Shipping.exe",
+  "race_model": {
+    "races_per_map": 1,
+    "has_difficulty_variants": false
+  },
+  "maps": [
+    {
+      "display_name": "Abyss",
+      "canonical_id": "abyss",
+      "plugin_id": "MAP_Abyss",
+      "world_path": "/MAP_Abyss/Maps/Abyss_Main",
+      "checkpoint_total": 31
+    },
+    { "display_name": "Academy", "canonical_id": "academy", "plugin_id": "MAP_Academy" },
+    { "display_name": "Bypass", "canonical_id": "bypass", "plugin_id": "MAP_Bypass" },
+    { "display_name": "Containment", "canonical_id": "containment", "plugin_id": "MAP_Containment" },
+    { "display_name": "Core", "canonical_id": "core", "plugin_id": "MAP_Core" },
+    { "display_name": "Drought (Onslaught)", "canonical_id": "drought_onslaught", "plugin_id": null },
+    { "display_name": "Eden", "canonical_id": "eden", "plugin_id": "MAP_Eden" },
+    { "display_name": "Foregone Destruction", "canonical_id": "foregone_destruction", "plugin_id": "MAP_Foregone_Destruction" },
+    { "display_name": "Fracture (Onslaught)", "canonical_id": "fracture_onslaught", "plugin_id": "MAP_Fracture" },
+    { "display_name": "Frontier", "canonical_id": "frontier", "plugin_id": "MAP_Frontier" },
+    { "display_name": "Glacier (Onslaught)", "canonical_id": "glacier_onslaught", "plugin_id": "MAP_Glacier" },
+    { "display_name": "Grit", "canonical_id": "grit", "plugin_id": "MAP_Grit" },
+    { "display_name": "Hammerhead", "canonical_id": "hammerhead", "plugin_id": "MAP_Hammerhead" },
+    { "display_name": "Inferno (Onslaught)", "canonical_id": "inferno_onslaught", "plugin_id": "MAP_Inferno" },
+    { "display_name": "Karman Station", "canonical_id": "karman_station", "plugin_id": "MAP_Karman_Station" },
+    { "display_name": "Oasis", "canonical_id": "oasis", "plugin_id": "MAP_Oasis" },
+    { "display_name": "Outskirts (Onslaught)", "canonical_id": "outskirts_onslaught", "plugin_id": null },
+    { "display_name": "Ozone", "canonical_id": "ozone", "plugin_id": "MAP_Ozone" },
+    { "display_name": "Runway", "canonical_id": "runway", "plugin_id": "MAP_Runway" },
+    { "display_name": "Sanctum (Onslaught)", "canonical_id": "sanctum_onslaught", "plugin_id": "MAP_Sanctum" },
+    { "display_name": "Simulation Anomaly", "canonical_id": "simulation_anomaly", "plugin_id": "MAP_Simulation" },
+    { "display_name": "Simulation Charlie", "canonical_id": "simulation_charlie", "plugin_id": "MAP_Simulation" },
+    { "display_name": "Simulation Divide", "canonical_id": "simulation_divide", "plugin_id": "MAP_Simulation" },
+    { "display_name": "Simulation Faceoff", "canonical_id": "simulation_faceoff", "plugin_id": "MAP_Simulation" },
+    { "display_name": "Simulation Hectic", "canonical_id": "simulation_hectic", "plugin_id": "MAP_Simulation" },
+    { "display_name": "Simulation Moshpit", "canonical_id": "simulation_moshpit", "plugin_id": "MAP_Simulation" },
+    { "display_name": "Split Worlds", "canonical_id": "split_worlds", "plugin_id": null },
+    { "display_name": "Stadium V2", "canonical_id": "stadium_v2", "plugin_id": "MAP_Stadium" },
+    { "display_name": "Terra13", "canonical_id": "terra13", "plugin_id": "MAP_Terra13" },
+    { "display_name": "TriHard", "canonical_id": "trihard", "plugin_id": "MAP_TriHard" },
+    { "display_name": "Zenith", "canonical_id": "zenith", "plugin_id": "MAP_Zenith" }
+  ]
+}
