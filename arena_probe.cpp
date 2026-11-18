@@ -635,10 +635,13 @@ int scan_arena_timers(HANDLE process, DWORD process_id) {
     uintptr_t image_base = 0;
     size_t image_size = 0;
     if (!find_main_module(process_id, image_base, image_size)) return 26;
-    constexpr uintptr_t kTimerVtableRva = 0xF5E4258;
-    constexpr uintptr_t kTimerOffset = 0x760;
+    // Arena Reloaded 3.1-643074: the authoritative race HUD clock lives on
+    // this Slate-side object as a double.  The rendered copies are transient;
+    // this owner survives normal frame-to-frame buffer churn.
+    constexpr uintptr_t kTimerVtableRva = 0xF4E9748;
+    constexpr uintptr_t kTimerOffset = 0x128;
     const uintptr_t timer_vtable = image_base + kTimerVtableRva;
-    struct Candidate { uintptr_t object; float before; };
+    struct Candidate { uintptr_t object; double before; };
     std::vector<Candidate> candidates;
     SYSTEM_INFO system{};
     GetNativeSystemInfo(&system);
@@ -659,11 +662,11 @@ int scan_arena_timers(HANDLE process, DWORD process_id) {
                         uintptr_t value = 0;
                         std::memcpy(&value, buffer.data() + offset, sizeof(value));
                         if (value != timer_vtable) continue;
-                        float timer = 0.0f;
+                        double timer = 0.0;
                         SIZE_T timer_received = 0;
                         const uintptr_t object = chunk + offset;
                         if (ReadProcessMemory(process, reinterpret_cast<void*>(object + kTimerOffset), &timer, sizeof(timer), &timer_received) &&
-                            timer_received == sizeof(timer) && std::isfinite(timer) && timer >= 0.0f && timer <= 3600.0f) {
+                            timer_received == sizeof(timer) && std::isfinite(timer) && timer >= 0.0 && timer <= 3600.0) {
                             candidates.push_back({object, timer});
                         }
                     }
@@ -677,13 +680,14 @@ int scan_arena_timers(HANDLE process, DWORD process_id) {
     Sleep(500);
     int live = 0;
     for (const Candidate& candidate : candidates) {
-        float after = 0.0f;
+        double after = 0.0;
         SIZE_T received = 0;
         if (!ReadProcessMemory(process, reinterpret_cast<void*>(candidate.object + kTimerOffset), &after, sizeof(after), &received) || received != sizeof(after)) continue;
-        const float delta = after - candidate.before;
-        if (std::isfinite(after) && delta >= 0.25f && delta <= 0.9f) {
-            std::wprintf(L"LIVE TIMER object=0x%llX value=%.3f delta=%.3f\n",
-                         static_cast<unsigned long long>(candidate.object), after, delta);
+        const double delta = after - candidate.before;
+        if (std::isfinite(after) && delta >= 0.25 && delta <= 0.9) {
+            std::wprintf(L"LIVE TIMER object=0x%llX address=0x%llX value=%.3f delta=%.3f\n",
+                         static_cast<unsigned long long>(candidate.object),
+                         static_cast<unsigned long long>(candidate.object + kTimerOffset), after, delta);
             ++live;
         }
     }
@@ -914,6 +918,22 @@ int scan_running_clocks(HANDLE process, const std::wstring& output_path, bool us
     for (const Candidate& candidate : candidates) {
         addresses.push_back(candidate.address);
         std::wprintf(L"  0x%llX = %.6f\n", static_cast<unsigned long long>(candidate.address), candidate.value);
+    }
+    if (use_double) {
+        std::vector<Candidate> sorted = candidates;
+        std::sort(sorted.begin(), sorted.end(), [](const Candidate& a, const Candidate& b) { return a.value < b.value; });
+        std::wprintf(L"Synchronized double-clock pairs (within 0.20 seconds):\n");
+        size_t pair_count = 0;
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            for (size_t j = i + 1; j < sorted.size() && sorted[j].value - sorted[i].value <= 0.20; ++j) {
+                std::wprintf(L"  0x%llX %.6f  <->  0x%llX %.6f  gap=%.6f\n",
+                             static_cast<unsigned long long>(sorted[i].address), sorted[i].value,
+                             static_cast<unsigned long long>(sorted[j].address), sorted[j].value,
+                             sorted[j].value - sorted[i].value);
+                ++pair_count;
+            }
+        }
+        std::wprintf(L"Found %zu synchronized pair(s).\n", pair_count);
     }
     if (!save_addresses(output_path, addresses)) return 21;
     return 0;
