@@ -19,7 +19,7 @@ extern const size_t g_bundled_overlay_dll_size;
 extern const unsigned char g_bundled_logo_png[];
 extern const size_t g_bundled_logo_png_size;
 
-static constexpr wchar_t CURRENT_VERSION[] = L"1.1.0";
+static constexpr wchar_t CURRENT_VERSION[] = L"1.1.1";
 static constexpr wchar_t RELEASE_API[] = L"https://api.github.com/repos/cody-raves/Splitsgate/releases/latest";
 
 struct ReleaseInfo {
@@ -217,13 +217,9 @@ static bool install_release(const ReleaseInfo& release, const std::filesystem::p
 static bool check_for_update(const std::filesystem::path& current_exe) {
     const auto release = latest_release(current_exe.filename().wstring());
     if (!release || !newer_version(release->version)) return false;
-    const std::wstring message = L"Splitsgate " + release->version +
-        L" is available.\n\nDownload, install, and relaunch it now?";
-    if (MessageBoxW(nullptr, message.c_str(), L"Splitsgate update available",
-            MB_ICONINFORMATION | MB_YESNO | MB_SETFOREGROUND) != IDYES) return false;
     if (install_release(*release, current_exe)) return true;
-    MessageBoxW(nullptr, L"The update could not be installed. The current version will load instead.",
-        L"Splitsgate update", MB_ICONWARNING | MB_OK | MB_SETFOREGROUND);
+    // A failed network check must never block the player. Continue loading the
+    // bundled overlay and try the update again the next time the launcher runs.
     return false;
 }
 

@@ -139,6 +139,8 @@ static std::atomic_bool g_arena_hud_valid = false;
 static bool g_arena_pixels_r10 = false;
 static std::chrono::steady_clock::time_point g_last_arena_map_read{};
 static uintptr_t g_arena_map_label = 0;
+static __int64 g_arena_log_offset = 0;
+static std::string g_arena_log_map;
 static std::mutex g_arena_map_mutex;
 static std::string g_arena_pending_map;
 static float g_arena_panel_x = 36.0f;
@@ -920,6 +922,44 @@ static bool scan_arena_map_label(std::string& name) {
     return false;
 }
 
+static std::string arena_map_name_from_asset(std::string asset) {
+    if (asset.empty()) return {};
+    const size_t query = asset.find_first_of("?&/\\\r\n'\" ");
+    if (query != std::string::npos) asset.resize(query);
+    if (asset.ends_with("_Main")) asset.resize(asset.size() - 5);
+    if (asset == "TriHard") return "TRIHARD";
+
+    std::string display;
+    display.reserve(asset.size() + 8);
+    for (size_t i = 0; i < asset.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(asset[i]);
+        if (c == '_') {
+            if (!display.empty() && display.back() != ' ') display.push_back(' ');
+            continue;
+        }
+        if (i > 0 && std::isupper(c)) {
+            const unsigned char previous = static_cast<unsigned char>(asset[i - 1]);
+            if (std::islower(previous) && !display.empty() && display.back() != ' ') display.push_back(' ');
+        }
+        display.push_back(static_cast<char>(std::toupper(c)));
+    }
+    return display;
+}
+
+static void parse_arena_log_maps(const std::string& text) {
+    size_t search_from = 0;
+    while (true) {
+        const size_t marker = text.find("MapContentDef=Asset|GF1047MapData:MapData_", search_from);
+        if (marker == std::string::npos) break;
+        const size_t start = marker + std::strlen("MapContentDef=Asset|GF1047MapData:MapData_");
+        const size_t end = text.find_first_of("?&/\\\r\n'\" ", start);
+        const std::string parsed = arena_map_name_from_asset(text.substr(start,
+            end == std::string::npos ? std::string::npos : end - start));
+        if (!parsed.empty()) g_arena_log_map = parsed;
+        search_from = start;
+    }
+}
+
 static void refresh_arena_map_name() {
     if (!g_arena_reloaded) return;
     const auto now = std::chrono::steady_clock::now();
@@ -930,26 +970,40 @@ static void refresh_arena_map_name() {
     if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH)) return;
     wchar_t path[MAX_PATH]{};
     _snwprintf_s(path, _TRUNCATE, L"%s\\PortalWars2\\Saved\\Logs\\PortalWars2.log", local_app_data);
-    FILE* file = nullptr;
     std::string name;
-    if (_wfopen_s(&file, path, L"rb") == 0 && file) {
-        _fseeki64(file, 0, SEEK_END);
-        const __int64 length = _ftelli64(file);
-        const __int64 tail_size = std::min<__int64>(length, 256 * 1024);
-        if (tail_size > 0 && _fseeki64(file, length - tail_size, SEEK_SET) == 0) {
-            std::string tail(static_cast<size_t>(tail_size), '\0');
-            const size_t bytes_read = fread(tail.data(), 1, tail.size(), file);
-            tail.resize(bytes_read);
-            const size_t marker = tail.rfind("/MAP_");
-            if (marker != std::string::npos) {
-                const size_t name_start = marker + 5;
-                size_t name_end = tail.find_first_of("/\\\r\n?'\" ", name_start);
-                if (name_end == std::string::npos) name_end = tail.size();
-                if (name_end > name_start && name_end - name_start <= 80)
-                    name = tail.substr(name_start, name_end - name_start);
-            }
+    // PortalWars2 keeps the active log open for writing. CRT file opens can
+    // fail intermittently, so explicitly share read/write/delete access with
+    // the game instead of falling back to an old UI string in memory.
+    HANDLE file = CreateFileW(path, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER file_size{};
+        const __int64 length = GetFileSizeEx(file, &file_size) ? file_size.QuadPart : 0;
+        // Read the whole current log on first use, then only newly appended
+        // bytes. A noisy session can push the last map load out of a small
+        // tail window, which previously left the overlay on the prior map.
+        if (length < g_arena_log_offset) {
+            g_arena_log_offset = 0;
+            g_arena_log_map.clear();
         }
-        fclose(file);
+        // Re-read a small overlap so a line that was only partly flushed on
+        // the previous poll cannot split the marker across two reads.
+        const __int64 read_from = g_arena_log_offset > 512 ? g_arena_log_offset - 512 : 0;
+        const __int64 unread = length - read_from;
+        LARGE_INTEGER position{};
+        position.QuadPart = read_from;
+        if (unread > 0 && unread <= static_cast<__int64>(std::numeric_limits<DWORD>::max()) &&
+            SetFilePointerEx(file, position, nullptr, FILE_BEGIN)) {
+            std::string appended(static_cast<size_t>(unread), '\0');
+            DWORD bytes_read = 0;
+            ReadFile(file, appended.data(), static_cast<DWORD>(appended.size()), &bytes_read, nullptr);
+            appended.resize(bytes_read);
+            parse_arena_log_maps(appended);
+            g_arena_log_offset = read_from + static_cast<__int64>(bytes_read);
+        }
+        CloseHandle(file);
+        name = g_arena_log_map;
     }
     // The game can hold its log exclusively while running. In that case the
     // active pause/lobby label is still resident as plain text, so cache that
