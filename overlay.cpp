@@ -657,6 +657,14 @@ constexpr uintptr_t CLOCK_OFFSET = 0x898;
 constexpr uintptr_t BALL_ARRAY_OWNER_OFFSET = 0x1470;
 constexpr uintptr_t BALL_ARRAY_COUNT_OFFSET = 0x898;
 
+// Arena Reloaded 3.1-643074. The race owner points to the native race state;
+// unlike the HUD capture fallback, these fields update in the simulation tick.
+constexpr uintptr_t ARENA_RACE_OWNER_VTABLE_RVA = 0xF5DD3E8;
+constexpr uintptr_t ARENA_STATE_POINTER_OFFSET = 0x20;
+constexpr uintptr_t ARENA_CLOCK_OFFSET = 0x40;
+constexpr uintptr_t ARENA_COUNT_OFFSET = 0x3CC;
+constexpr uintptr_t ARENA_TOTAL_OFFSET = 0x3D0;
+
 static bool readable_address(uintptr_t address, size_t size) {
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi))) return false;
@@ -668,6 +676,18 @@ static bool readable_address(uintptr_t address, size_t size) {
 
 static bool race_sample(uintptr_t race, int& count, double& clock) {
     if (g_arena_reloaded) {
+        if (race && readable_address(race + ARENA_CLOCK_OFFSET, ARENA_TOTAL_OFFSET - ARENA_CLOCK_OFFSET + sizeof(int))) {
+            float native_clock = 0.0f;
+            int total = 0;
+            std::memcpy(&native_clock, reinterpret_cast<void*>(race + ARENA_CLOCK_OFFSET), sizeof(native_clock));
+            std::memcpy(&count, reinterpret_cast<void*>(race + ARENA_COUNT_OFFSET), sizeof(count));
+            std::memcpy(&total, reinterpret_cast<void*>(race + ARENA_TOTAL_OFFSET), sizeof(total));
+            clock = native_clock;
+            if (std::isfinite(clock) && clock >= 0.0 && clock < 3600.5 &&
+                total >= 1 && total <= 128 && count >= 0 && count <= total) return true;
+        }
+        // Keep the DirectX HUD reader as a compatibility fallback for future
+        // game builds whose native object signature has changed.
         if (!g_arena_hud_valid.load(std::memory_order_acquire)) return false;
         count = g_arena_count.load(std::memory_order_acquire);
         clock = g_arena_clock.load(std::memory_order_acquire);
@@ -680,7 +700,14 @@ static bool race_sample(uintptr_t race, int& count, double& clock) {
 }
 
 static int race_total_balls(uintptr_t race) {
-    if (g_arena_reloaded) return g_arena_total.load(std::memory_order_acquire);
+    if (g_arena_reloaded) {
+        if (race && readable_address(race + ARENA_TOTAL_OFFSET, sizeof(int))) {
+            int total = 0;
+            std::memcpy(&total, reinterpret_cast<void*>(race + ARENA_TOTAL_OFFSET), sizeof(total));
+            if (total >= 1 && total <= 128) return total;
+        }
+        return g_arena_total.load(std::memory_order_acquire);
+    }
     if (!readable_address(race + BALL_ARRAY_OWNER_OFFSET, sizeof(uintptr_t))) return 0;
     uintptr_t owner = 0;
     std::memcpy(&owner, reinterpret_cast<void*>(race + BALL_ARRAY_OWNER_OFFSET), sizeof(owner));
@@ -689,6 +716,54 @@ static int race_total_balls(uintptr_t race) {
     std::memcpy(&total, reinterpret_cast<void*>(owner + BALL_ARRAY_COUNT_OFFSET), sizeof(total));
     std::memcpy(&capacity, reinterpret_cast<void*>(owner + BALL_ARRAY_COUNT_OFFSET + sizeof(int)), sizeof(capacity));
     return total >= 3 && total <= 40 && capacity >= total && capacity <= 64 ? total : 0;
+}
+
+static uintptr_t locate_arena_race() {
+    const uintptr_t image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const uintptr_t expected_vtable = image + ARENA_RACE_OWNER_VTABLE_RVA;
+    struct Candidate { uintptr_t state; float clock; int count; int total; };
+    std::vector<Candidate> candidates;
+    SYSTEM_INFO system{};
+    GetNativeSystemInfo(&system);
+    uintptr_t address = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
+    const uintptr_t maximum = reinterpret_cast<uintptr_t>(system.lpMaximumApplicationAddress);
+    MEMORY_BASIC_INFORMATION mbi{};
+    while (address < maximum && VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi))) {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        const uintptr_t end = begin + mbi.RegionSize;
+        const DWORD basic = mbi.Protect & 0xff;
+        const bool writable = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+            (basic == PAGE_READWRITE || basic == PAGE_WRITECOPY || basic == PAGE_EXECUTE_READWRITE || basic == PAGE_EXECUTE_WRITECOPY);
+        if (writable) {
+            for (uintptr_t owner = begin; owner + ARENA_STATE_POINTER_OFFSET + sizeof(uintptr_t) <= end; owner += sizeof(uintptr_t)) {
+                uintptr_t vtable = 0;
+                std::memcpy(&vtable, reinterpret_cast<void*>(owner), sizeof(vtable));
+                if (vtable != expected_vtable) continue;
+                uintptr_t state = 0;
+                std::memcpy(&state, reinterpret_cast<void*>(owner + ARENA_STATE_POINTER_OFFSET), sizeof(state));
+                if (!state || !readable_address(state + ARENA_CLOCK_OFFSET, ARENA_TOTAL_OFFSET - ARENA_CLOCK_OFFSET + sizeof(int))) continue;
+                float clock = 0.0f;
+                int count = -1, total = -1;
+                std::memcpy(&clock, reinterpret_cast<void*>(state + ARENA_CLOCK_OFFSET), sizeof(clock));
+                std::memcpy(&count, reinterpret_cast<void*>(state + ARENA_COUNT_OFFSET), sizeof(count));
+                std::memcpy(&total, reinterpret_cast<void*>(state + ARENA_TOTAL_OFFSET), sizeof(total));
+                if (std::isfinite(clock) && clock >= 0.0f && clock < 3600.5f &&
+                    total >= 1 && total <= 128 && count >= 0 && count <= total)
+                    candidates.push_back({state, clock, count, total});
+            }
+        }
+        if (end <= address) break;
+        address = end;
+    }
+    Sleep(50);
+    for (const Candidate& candidate : candidates) {
+        int count = 0;
+        double clock = 0.0;
+        if (!race_sample(candidate.state, count, clock) || count != candidate.count) continue;
+        const double delta = clock - candidate.clock;
+        if (delta >= 0.015 && delta <= 0.20) return candidate.state;
+    }
+    return 0;
 }
 
 static uintptr_t locate_race() {
@@ -1895,6 +1970,8 @@ static DWORD WINAPI overlay_thread(void*) {
         void* map_selected_exec = reinterpret_cast<void*>(image + MAP_SELECTED_EXEC_RVA);
         if (MH_CreateHook(map_selected_exec, &hooked_map_selected_exec, reinterpret_cast<void**>(&g_original_map_selected_exec)) != MH_OK) return 6;
     } else {
+        // Sentinel keeps the visual reader available while the native Arena
+        // race object is being located (or after a future incompatible update).
         g_race_object.store(1, std::memory_order_release);
         g_map_name = "ARENA RELOADED";
         g_difficulty = "RACE";
@@ -1907,6 +1984,8 @@ static DWORD WINAPI overlay_thread(void*) {
     bool restart_was_down = false;
     auto restart_hold_started = std::chrono::steady_clock::now();
     auto next_locator_check = std::chrono::steady_clock::now();
+    auto arena_last_advanced = std::chrono::steady_clock::now();
+    double arena_previous_clock = -1.0;
     while (!(GetAsyncKeyState(VK_END) & 1)) {
         uintptr_t race = g_race_object.load();
         int count = 0; double clock = 0;
@@ -1925,6 +2004,11 @@ static DWORD WINAPI overlay_thread(void*) {
         }
 
         const auto now = std::chrono::steady_clock::now();
+        if (g_arena_reloaded && valid) {
+            if (arena_previous_clock < 0.0 || clock > arena_previous_clock + 0.0001 || clock + 0.50 < arena_previous_clock)
+                arena_last_advanced = now;
+            arena_previous_clock = clock;
+        }
         const bool restart_down = !g_arena_reloaded && g_restart_key_down.load(std::memory_order_acquire);
         if (restart_down) {
             if (!restart_was_down) restart_hold_started = now;
@@ -1944,7 +2028,17 @@ static DWORD WINAPI overlay_thread(void*) {
         // Lobby objects can retain the just-exited race with a perfectly valid
         // frozen clock. Do not let the background locator re-adopt that stale
         // object after the render thread has cleared it for the lobby.
-        if (!g_arena_reloaded && (!valid || g_finished) &&
+        if (g_arena_reloaded && (race <= 1 || !valid || now - arena_last_advanced >= std::chrono::milliseconds(1500)) &&
+            now >= next_locator_check) {
+            const uintptr_t located = locate_arena_race();
+            if (located && located != race) {
+                g_race_object.store(located, std::memory_order_release);
+                sampled_count = -1;
+                arena_previous_clock = -1.0;
+                arena_last_advanced = std::chrono::steady_clock::now();
+            }
+            next_locator_check = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        } else if (!g_arena_reloaded && (!valid || g_finished) &&
             !g_in_race_lobby.load(std::memory_order_acquire) &&
             now >= next_locator_check) {
             const uintptr_t located = locate_race();

@@ -31,6 +31,33 @@ DWORD find_process() {
     return result;
 }
 
+int set_process_suspended(DWORD process_id, bool suspended) {
+    HANDLE process = OpenProcess(PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+    if (!process) {
+        std::fwprintf(stderr, L"Could not open process %lu for %ls (error %lu).\n",
+                      process_id, suspended ? L"suspend" : L"resume", GetLastError());
+        return 37;
+    }
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    using NtProcessControlFn = LONG (NTAPI*)(HANDLE);
+    auto control = reinterpret_cast<NtProcessControlFn>(
+        GetProcAddress(ntdll, suspended ? "NtSuspendProcess" : "NtResumeProcess"));
+    if (!control) {
+        CloseHandle(process);
+        std::fwprintf(stderr, L"Could not locate the Windows process-control routine.\n");
+        return 38;
+    }
+    const LONG status = control(process);
+    CloseHandle(process);
+    if (status < 0) {
+        std::fwprintf(stderr, L"Could not %ls process %lu (NTSTATUS 0x%08lX).\n",
+                      suspended ? L"suspend" : L"resume", process_id, status);
+        return 39;
+    }
+    std::wprintf(L"Arena Reloaded process %lu %ls.\n", process_id, suspended ? L"suspended" : L"resumed");
+    return 0;
+}
+
 bool find_main_module(DWORD process_id, uintptr_t& base, size_t& size) {
     MODULEENTRY32W entry{sizeof(entry)};
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process_id);
@@ -794,6 +821,201 @@ const wchar_t* timer_form_name(uint32_t form) {
     return form < 10 ? names[form] : L"unknown";
 }
 
+double read_timer_form_value(HANDLE process, const TimerFormRecord& record, bool& ok) {
+    uint8_t bytes[8]{};
+    SIZE_T received = 0;
+    const size_t width = (record.form == 2 || record.form == 3 || record.form >= 8) ? 8 : 4;
+    ok = ReadProcessMemory(process, reinterpret_cast<void*>(record.address), bytes, width, &received) && received == width;
+    if (!ok) return 0.0;
+    switch (record.form) {
+        case 0: case 1: { float value = 0.0f; std::memcpy(&value, bytes, sizeof(value)); return value; }
+        case 2: case 3: { double value = 0.0; std::memcpy(&value, bytes, sizeof(value)); return value; }
+        case 4: case 5: { int32_t value = 0; std::memcpy(&value, bytes, sizeof(value)); return value / 100.0; }
+        case 6: case 7: { int32_t value = 0; std::memcpy(&value, bytes, sizeof(value)); return value / 1000.0; }
+        case 8: case 9: { int64_t value = 0; std::memcpy(&value, bytes, sizeof(value)); return value / 10'000'000.0; }
+        default: ok = false; return 0.0;
+    }
+}
+
+int inspect_timer_forms(HANDLE process, DWORD process_id, const std::wstring& input_path, int expected_total) {
+    std::vector<TimerFormRecord> records;
+    if (!load_timer_forms(input_path, records)) return 35;
+    uintptr_t image_base = 0;
+    size_t image_size = 0;
+    find_main_module(process_id, image_base, image_size);
+    std::wprintf(L"Inspecting %zu timer candidates (race total %d):\n", records.size(), expected_total);
+    for (size_t index = 0; index < records.size(); ++index) {
+        const TimerFormRecord& record = records[index];
+        bool value_ok = false;
+        const double value = read_timer_form_value(process, record, value_ok);
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQueryEx(process, reinterpret_cast<void*>(record.address), &mbi, sizeof(mbi))) continue;
+        const uintptr_t region_begin = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        const uintptr_t region_end = region_begin + mbi.RegionSize;
+        const uintptr_t begin = std::max(region_begin, record.address > 0x4000 ? record.address - 0x4000 : region_begin);
+        const uintptr_t end = std::min(region_end, record.address + 0x4000);
+        std::vector<uint8_t> bytes(static_cast<size_t>(end - begin));
+        SIZE_T received = 0;
+        ReadProcessMemory(process, reinterpret_cast<void*>(begin), bytes.data(), bytes.size(), &received);
+        std::wprintf(L"\n[%zu] 0x%llX  %-25ls value=%s%.6f\n",
+                     index, static_cast<unsigned long long>(record.address), timer_form_name(record.form),
+                     value_ok ? L"" : L"unreadable/", value);
+        std::wprintf(L"    allocation=0x%llX region=0x%llX..0x%llX timer-region-offset=0x%llX protect=0x%lX\n",
+                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.AllocationBase)),
+                     static_cast<unsigned long long>(region_begin), static_cast<unsigned long long>(region_end),
+                     static_cast<unsigned long long>(record.address - region_begin), mbi.Protect);
+
+        int total_hits = 0;
+        std::wprintf(L"    nearby total %d offsets:", expected_total);
+        for (size_t offset = 0; offset + sizeof(int32_t) <= received; offset += 4) {
+            int32_t candidate = 0;
+            std::memcpy(&candidate, bytes.data() + offset, sizeof(candidate));
+            if (candidate == expected_total) {
+                const intptr_t relative = static_cast<intptr_t>(begin + offset) - static_cast<intptr_t>(record.address);
+                std::wprintf(L" %+lld", static_cast<long long>(relative));
+                if (++total_hits >= 24) break;
+            }
+        }
+        if (!total_hits) std::wprintf(L" none");
+        std::wprintf(L"\n");
+
+        int pair_hits = 0;
+        std::wprintf(L"    nearby [0,%d] or [%d,0] pairs:", expected_total, expected_total);
+        for (size_t offset = 0; offset + 8 <= received; offset += 4) {
+            int32_t first = 0, second = 0;
+            std::memcpy(&first, bytes.data() + offset, 4);
+            std::memcpy(&second, bytes.data() + offset + 4, 4);
+            if ((first == 0 && second == expected_total) || (first == expected_total && second == 0)) {
+                const intptr_t relative = static_cast<intptr_t>(begin + offset) - static_cast<intptr_t>(record.address);
+                std::wprintf(L" %+lld(%d,%d)", static_cast<long long>(relative), first, second);
+                if (++pair_hits >= 24) break;
+            }
+        }
+        if (!pair_hits) std::wprintf(L" none");
+        std::wprintf(L"\n");
+
+        int object_hits = 0;
+        std::wprintf(L"    possible UE object starts before timer:");
+        const size_t timer_offset = static_cast<size_t>(record.address - begin);
+        for (size_t cursor = std::min(timer_offset, static_cast<size_t>(received)); cursor >= sizeof(uintptr_t);) {
+            cursor -= sizeof(uintptr_t);
+            const size_t offset = cursor;
+            uintptr_t pointer = 0;
+            std::memcpy(&pointer, bytes.data() + offset, sizeof(pointer));
+            if (image_base && pointer >= image_base && pointer < image_base + image_size) {
+                const intptr_t relative = static_cast<intptr_t>(begin + offset) - static_cast<intptr_t>(record.address);
+                std::wprintf(L" %+lld(vtRVA=0x%llX)", static_cast<long long>(relative),
+                             static_cast<unsigned long long>(pointer - image_base));
+                if (++object_hits >= 16) break;
+            }
+            if (cursor == 0) break;
+        }
+        if (!object_hits) std::wprintf(L" none");
+        std::wprintf(L"\n");
+    }
+    return 0;
+}
+
+int find_pointer_references(HANDLE process, DWORD process_id, uintptr_t target) {
+    SYSTEM_INFO system{};
+    GetNativeSystemInfo(&system);
+    uintptr_t image_base = 0;
+    size_t image_size = 0;
+    find_main_module(process_id, image_base, image_size);
+    uintptr_t cursor = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
+    const uintptr_t maximum = reinterpret_cast<uintptr_t>(system.lpMaximumApplicationAddress);
+    constexpr size_t kChunkSize = 4 * 1024 * 1024;
+    std::vector<uint8_t> bytes(kChunkSize + sizeof(uintptr_t));
+    MEMORY_BASIC_INFORMATION mbi{};
+    size_t hits = 0;
+    std::wprintf(L"Pointer references to 0x%llX:\n", static_cast<unsigned long long>(target));
+    while (cursor < maximum && VirtualQueryEx(process, reinterpret_cast<void*>(cursor), &mbi, sizeof(mbi))) {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        const uintptr_t end = begin + mbi.RegionSize;
+        if (readable_writable_region(mbi)) {
+            for (uintptr_t chunk = begin; chunk < end;) {
+                const size_t requested = static_cast<size_t>(std::min<uintptr_t>(kChunkSize, end - chunk));
+                SIZE_T received = 0;
+                if (ReadProcessMemory(process, reinterpret_cast<void*>(chunk), bytes.data(), requested, &received)) {
+                    for (size_t offset = 0; offset + sizeof(uintptr_t) <= received; offset += sizeof(uintptr_t)) {
+                        uintptr_t value = 0;
+                        std::memcpy(&value, bytes.data() + offset, sizeof(value));
+                        if (value != target) continue;
+                        const uintptr_t address = chunk + offset;
+                        if (image_base && address >= image_base && address < image_base + image_size)
+                            std::wprintf(L"  0x%llX  main+0x%llX\n", static_cast<unsigned long long>(address),
+                                         static_cast<unsigned long long>(address - image_base));
+                        else
+                            std::wprintf(L"  0x%llX\n", static_cast<unsigned long long>(address));
+                        ++hits;
+                    }
+                }
+                chunk += requested;
+            }
+        }
+        if (end <= cursor) break;
+        cursor = end;
+    }
+    std::wprintf(L"Found %zu references.\n", hits);
+    return hits ? 0 : 36;
+}
+
+int locate_arena_race(HANDLE process, DWORD process_id) {
+    constexpr uintptr_t kRaceOwnerVtableRva = 0xF5DD3E8;
+    constexpr uintptr_t kStatePointerOffset = 0x20;
+    constexpr uintptr_t kTimerOffset = 0x40;
+    constexpr uintptr_t kCurrentOffset = 0x3CC;
+    constexpr uintptr_t kTotalOffset = 0x3D0;
+    uintptr_t image_base = 0;
+    size_t image_size = 0;
+    if (!find_main_module(process_id, image_base, image_size)) return 40;
+    const uintptr_t expected_vtable = image_base + kRaceOwnerVtableRva;
+    SYSTEM_INFO system{};
+    GetNativeSystemInfo(&system);
+    uintptr_t cursor = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
+    const uintptr_t maximum = reinterpret_cast<uintptr_t>(system.lpMaximumApplicationAddress);
+    constexpr size_t kChunkSize = 4 * 1024 * 1024;
+    std::vector<uint8_t> bytes(kChunkSize);
+    MEMORY_BASIC_INFORMATION mbi{};
+    int matches = 0;
+    while (cursor < maximum && VirtualQueryEx(process, reinterpret_cast<void*>(cursor), &mbi, sizeof(mbi))) {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        const uintptr_t end = begin + mbi.RegionSize;
+        if (readable_writable_region(mbi)) {
+            for (uintptr_t chunk = begin; chunk < end;) {
+                const size_t requested = static_cast<size_t>(std::min<uintptr_t>(kChunkSize, end - chunk));
+                SIZE_T received = 0;
+                if (ReadProcessMemory(process, reinterpret_cast<void*>(chunk), bytes.data(), requested, &received)) {
+                    for (size_t offset = 0; offset + sizeof(uintptr_t) <= received; offset += sizeof(uintptr_t)) {
+                        uintptr_t vtable = 0;
+                        std::memcpy(&vtable, bytes.data() + offset, sizeof(vtable));
+                        if (vtable != expected_vtable) continue;
+                        const uintptr_t owner = chunk + offset;
+                        uintptr_t state = 0;
+                        float timer = 0.0f;
+                        int32_t current = -1, total = -1;
+                        SIZE_T got = 0;
+                        if (!ReadProcessMemory(process, reinterpret_cast<void*>(owner + kStatePointerOffset), &state, sizeof(state), &got) || got != sizeof(state)) continue;
+                        if (!ReadProcessMemory(process, reinterpret_cast<void*>(state + kTimerOffset), &timer, sizeof(timer), &got) || got != sizeof(timer)) continue;
+                        if (!ReadProcessMemory(process, reinterpret_cast<void*>(state + kCurrentOffset), &current, sizeof(current), &got) || got != sizeof(current)) continue;
+                        if (!ReadProcessMemory(process, reinterpret_cast<void*>(state + kTotalOffset), &total, sizeof(total), &got) || got != sizeof(total)) continue;
+                        if (!std::isfinite(timer) || timer < 0.0f || timer > 3605.0f || total < 1 || total > 128 || current < 0 || current > total) continue;
+                        std::wprintf(L"ARENA race owner=0x%llX state=0x%llX timer=0x%llX %.6f count=%d/%d\n",
+                                     static_cast<unsigned long long>(owner), static_cast<unsigned long long>(state),
+                                     static_cast<unsigned long long>(state + kTimerOffset), timer, current, total);
+                        ++matches;
+                    }
+                }
+                chunk += requested;
+            }
+        }
+        if (end <= cursor) break;
+        cursor = end;
+    }
+    std::wprintf(L"Validated %d Arena Reloaded race object(s).\n", matches);
+    return matches ? 0 : 41;
+}
+
 int scan_timer_forms(HANDLE process, double elapsed, const std::wstring& output_path) {
     SYSTEM_INFO system{}; GetNativeSystemInfo(&system);
     uintptr_t cursor = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
@@ -1077,6 +1299,8 @@ int filter_clock_delta(HANDLE process, double expected_delta, double tolerance, 
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    const bool suspend_process = argc >= 2 && _wcsicmp(argv[1], L"suspend") == 0;
+    const bool resume_process = argc >= 2 && _wcsicmp(argv[1], L"resume") == 0;
     const bool inspect = argc >= 3 && _wcsicmp(argv[1], L"inspect") == 0;
     const bool roots = argc >= 3 && _wcsicmp(argv[1], L"roots") == 0;
     const bool find_race = argc >= 3 && _wcsicmp(argv[1], L"findrace") == 0;
@@ -1095,6 +1319,9 @@ int wmain(int argc, wchar_t** argv) {
     const bool scan_balls = argc >= 5 && _wcsicmp(argv[1], L"scanballs") == 0;
     const bool scan_forms = argc >= 4 && _wcsicmp(argv[1], L"scanforms") == 0;
     const bool filter_forms = argc >= 5 && _wcsicmp(argv[1], L"filterforms") == 0;
+    const bool inspect_forms = argc >= 4 && _wcsicmp(argv[1], L"inspectforms") == 0;
+    const bool find_pointer = argc >= 3 && _wcsicmp(argv[1], L"findptr") == 0;
+    const bool locate_arena = argc >= 2 && _wcsicmp(argv[1], L"locatearena") == 0;
     const bool scan_running_float = argc >= 3 && _wcsicmp(argv[1], L"scanrunningfloat") == 0;
     const bool scan_running_double = argc >= 3 && _wcsicmp(argv[1], L"scanrunningdouble") == 0;
     const bool refine_running_float = argc >= 5 && _wcsicmp(argv[1], L"refinerunningfloat") == 0;
@@ -1104,8 +1331,8 @@ int wmain(int argc, wchar_t** argv) {
     const bool delta_clocks_float = argc >= 6 && _wcsicmp(argv[1], L"deltaclocksfloat") == 0;
     const bool delta_clocks_double = argc >= 6 && _wcsicmp(argv[1], L"deltaclocksdouble") == 0;
     const bool special_clock_mode = snapshot_clocks_float || snapshot_clocks_double || delta_clocks_float || delta_clocks_double;
-    if ((!inspect && !roots && !find_race && !analyze && !scan_float && !filter_float_mode && !scan_double && !scan_ticks && !filter_double && !filter_ticks && !scan_text && !scan_maps && !scan_timer && !peek_float_mode && !peek_ball_mode && !scan_balls && !scan_forms && !filter_forms && !scan_running_float && !scan_running_double && !refine_running_float && !refine_running_double && !special_clock_mode && argc < 4) || (!inspect && !roots && !find_race && !analyze && !scan_float && !filter_float_mode && !scan_double && !scan_ticks && !filter_double && !filter_ticks && !scan_text && !scan_maps && !scan_timer && !peek_float_mode && !peek_ball_mode && !scan_balls && !scan_forms && !filter_forms && !scan_running_float && !scan_running_double && !refine_running_float && !refine_running_double && !special_clock_mode && _wcsicmp(argv[1], L"snapshot") != 0 && _wcsicmp(argv[1], L"filter") != 0)) {
-        std::fwprintf(stderr, L"Usage:\n  ArenaRaceProbe snapshot <value> <output.bin>\n  ArenaRaceProbe filter <value> <input.bin> <output.bin>\n  ArenaRaceProbe inspect <input.bin>\n  ArenaRaceProbe roots <input.bin>\n  ArenaRaceProbe findrace <current-count>\n  ArenaRaceProbe analyze <clock-address-hex>\n  ArenaRaceProbe scanfloat <seconds> <tolerance> <output.bin>\n  ArenaRaceProbe filterfloat <seconds> <tolerance> <input.bin> <output.bin>\n  ArenaRaceProbe scandouble <seconds> <tolerance> <output.bin>\n  ArenaRaceProbe scanticks <seconds> <tolerance> <output.bin>\n  ArenaRaceProbe filterdouble <seconds> <tolerance> <input.bin> <output.bin>\n  ArenaRaceProbe filterticks <seconds> <tolerance> <input.bin> <output.bin>\n");
+    if ((!suspend_process && !resume_process && !inspect && !roots && !find_race && !analyze && !scan_float && !filter_float_mode && !scan_double && !scan_ticks && !filter_double && !filter_ticks && !scan_text && !scan_maps && !scan_timer && !peek_float_mode && !peek_ball_mode && !scan_balls && !scan_forms && !filter_forms && !inspect_forms && !find_pointer && !locate_arena && !scan_running_float && !scan_running_double && !refine_running_float && !refine_running_double && !special_clock_mode && argc < 4) || (!suspend_process && !resume_process && !inspect && !roots && !find_race && !analyze && !scan_float && !filter_float_mode && !scan_double && !scan_ticks && !filter_double && !filter_ticks && !scan_text && !scan_maps && !scan_timer && !peek_float_mode && !peek_ball_mode && !scan_balls && !scan_forms && !filter_forms && !inspect_forms && !find_pointer && !locate_arena && !scan_running_float && !scan_running_double && !refine_running_float && !refine_running_double && !special_clock_mode && _wcsicmp(argv[1], L"snapshot") != 0 && _wcsicmp(argv[1], L"filter") != 0)) {
+        std::fwprintf(stderr, L"Usage:\n  ArenaRaceProbe suspend\n  ArenaRaceProbe resume\n  ArenaRaceProbe locatearena\n  ArenaRaceProbe snapshot <value> <output.bin>\n  ArenaRaceProbe filter <value> <input.bin> <output.bin>\n  ArenaRaceProbe inspect <input.bin>\n  ArenaRaceProbe inspectforms <input.bin> <race-total>\n  ArenaRaceProbe findptr <address-hex>\n  ArenaRaceProbe roots <input.bin>\n  ArenaRaceProbe findrace <current-count>\n  ArenaRaceProbe analyze <clock-address-hex>\n  ArenaRaceProbe scanfloat <seconds> <tolerance> <output.bin>\n  ArenaRaceProbe filterfloat <seconds> <tolerance> <input.bin> <output.bin>\n  ArenaRaceProbe scandouble <seconds> <tolerance> <output.bin>\n  ArenaRaceProbe scanticks <seconds> <tolerance> <output.bin>\n  ArenaRaceProbe filterdouble <seconds> <tolerance> <input.bin> <output.bin>\n  ArenaRaceProbe filterticks <seconds> <tolerance> <input.bin> <output.bin>\n");
         return 1;
     }
     const DWORD process_id = find_process();
@@ -1113,12 +1340,13 @@ int wmain(int argc, wchar_t** argv) {
         std::fwprintf(stderr, L"Arena Reloaded is not running.\n");
         return 2;
     }
+    if (suspend_process || resume_process) return set_process_suspended(process_id, suspend_process);
     HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, process_id);
     if (!process) {
         std::fwprintf(stderr, L"Could not open process %lu (error %lu).\n", process_id, GetLastError());
         return 3;
     }
-    const int target = (inspect || roots || analyze || scan_float || filter_float_mode || scan_double || scan_ticks || filter_double || filter_ticks || scan_text || scan_maps || scan_timer || peek_float_mode || peek_ball_mode || scan_forms || filter_forms || scan_running_float || scan_running_double || refine_running_float || refine_running_double || special_clock_mode) ? 0 : _wtoi(argv[2]);
+    const int target = (inspect || roots || analyze || scan_float || filter_float_mode || scan_double || scan_ticks || filter_double || filter_ticks || scan_text || scan_maps || scan_timer || peek_float_mode || peek_ball_mode || scan_forms || filter_forms || inspect_forms || find_pointer || locate_arena || scan_running_float || scan_running_double || refine_running_float || refine_running_double || special_clock_mode) ? 0 : _wtoi(argv[2]);
     int result = 0;
     if (inspect) {
         result = inspect_addresses(process, argv[2]);
@@ -1153,6 +1381,12 @@ int wmain(int argc, wchar_t** argv) {
         result = scan_timer_forms(process, _wtof(argv[2]), argv[3]);
     } else if (filter_forms) {
         result = filter_timer_forms(process, _wtof(argv[2]), argv[3], argv[4]);
+    } else if (inspect_forms) {
+        result = inspect_timer_forms(process, process_id, argv[2], _wtoi(argv[3]));
+    } else if (find_pointer) {
+        result = find_pointer_references(process, process_id, static_cast<uintptr_t>(_wcstoui64(argv[2], nullptr, 16)));
+    } else if (locate_arena) {
+        result = locate_arena_race(process, process_id);
     } else if (scan_running_float || scan_running_double) {
         result = scan_running_clocks(process, argv[2], scan_running_double);
     } else if (refine_running_float || refine_running_double) {
