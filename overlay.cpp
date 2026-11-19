@@ -417,8 +417,12 @@ static LRESULT CALLBACK overlay_wndproc(HWND window, UINT message, WPARAM wparam
         }
         const uintptr_t expected_widget_vtable = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + RESTART_WIDGET_VTABLE_RVA;
         if (widget_vtable != expected_widget_vtable) {
-            widget = find_current_restart_widget();
-            if (widget) g_restart_widget.store(widget, std::memory_order_release);
+            // Never scan the full UObject address space from this window
+            // callback: it runs on the game thread and visibly stalls the
+            // simulation. A widget captured by the normal game hooks is safe;
+            // otherwise use the controller path below.
+            widget = 0;
+            g_restart_widget.store(0, std::memory_order_release);
         }
         g_restart_dispatch_pending.store(false, std::memory_order_release);
         // Prefer the game's actual restart widget callback. Besides restarting,
