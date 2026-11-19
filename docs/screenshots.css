@@ -1,0 +1,108 @@
+.screenshots {
+  padding-top: 96px;
+  padding-bottom: 96px;
+}
+
+.screenshot-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 22px;
+}
+
+.screenshot-card {
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid #24536a;
+  border-radius: 15px;
+  background: #091b29;
+  box-shadow: 0 24px 60px #0004;
+}
+
+.screenshot-card.featured {
+  grid-column: 1 / -1;
+}
+
+.screenshot-card > a {
+  display: block;
+  overflow: hidden;
+  background: #02070b;
+}
+
+.screenshot-card img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  transition: transform .35s ease, filter .35s ease;
+}
+
+.screenshot-card a:hover img {
+  transform: scale(1.015);
+  filter: brightness(1.06);
+}
+
+.screenshot-card figcaption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 18px 20px;
+}
+
+.screenshot-card figcaption div {
+  display: flex;
+  flex-direction: column;
+}
+
+.screenshot-card figcaption strong {
+  font-size: 1.05rem;
+}
+
+.screenshot-card figcaption span {
+  color: #91aab7;
+  font-size: .9rem;
+}
+
+.screenshot-card figcaption > b {
+  color: var(--cyan);
+  font-size: .74rem;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.community-actions {
+  justify-content: center;
+}
+
+.footer-links {
+  display: flex;
+  gap: 22px;
+}
+
+@media (max-width: 900px) {
+  .screenshot-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .screenshot-card.featured {
+    grid-column: auto;
+  }
+}
+
+@media (max-width: 560px) {
+  .screenshot-card figcaption {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .community-actions .button {
+    width: 100%;
+  }
+
+  .footer-links {
+    flex-direction: column;
+    gap: 6px;
+  }
+}
