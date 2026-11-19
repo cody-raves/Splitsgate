@@ -410,9 +410,24 @@ static LRESULT CALLBACK overlay_wndproc(HWND window, UINT message, WPARAM wparam
         // it only starts working again after the pause menu refreshes it.
         uintptr_t controller = restart_controller_from_world_context(g_race_object.load(std::memory_order_acquire));
         if (controller) g_restart_controller.store(controller, std::memory_order_release);
-        const uintptr_t widget = g_restart_widget.load(std::memory_order_acquire);
+        uintptr_t widget = g_restart_widget.load(std::memory_order_acquire);
+        uintptr_t widget_vtable = 0;
+        if (widget && readable_address(widget, sizeof(widget_vtable))) {
+            std::memcpy(&widget_vtable, reinterpret_cast<void*>(widget), sizeof(widget_vtable));
+        }
+        const uintptr_t expected_widget_vtable = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + RESTART_WIDGET_VTABLE_RVA;
+        if (widget_vtable != expected_widget_vtable) {
+            widget = find_current_restart_widget();
+            if (widget) g_restart_widget.store(widget, std::memory_order_release);
+        }
         g_restart_dispatch_pending.store(false, std::memory_order_release);
-        if (controller && readable_address(controller, sizeof(uintptr_t))) {
+        // Prefer the game's actual restart widget callback. Besides restarting,
+        // it initializes the per-race controller state that previously only
+        // became ready after opening the pause menu once.
+        if (widget && g_original_restart_race) {
+            g_restart_transition_pending.store(true, std::memory_order_release);
+            g_original_restart_race(reinterpret_cast<void*>(widget));
+        } else if (controller && readable_address(controller, sizeof(uintptr_t))) {
             uintptr_t vtable = 0;
             std::memcpy(&vtable, reinterpret_cast<void*>(controller), sizeof(vtable));
             uintptr_t restart_method = 0;
@@ -423,9 +438,6 @@ static LRESULT CALLBACK overlay_wndproc(HWND window, UINT message, WPARAM wparam
                 g_restart_transition_pending.store(true, std::memory_order_release);
                 reinterpret_cast<void(__fastcall*)(void*)>(restart_method)(reinterpret_cast<void*>(controller));
             }
-        } else if (widget && g_original_restart_race) {
-            g_restart_transition_pending.store(true, std::memory_order_release);
-            g_original_restart_race(reinterpret_cast<void*>(widget));
         }
         return 0;
     }
@@ -1208,7 +1220,7 @@ static void draw_proof_of_concept() {
 
     // Match Splitgate 2's unobtrusive race restart affordance. The fill gives
     // clear feedback that a tap is harmless and releasing early cancels it.
-    if (have_race && g_race_running && !g_finished && !g_in_race_lobby.load(std::memory_order_acquire)) {
+    if (have_race && (g_race_running || g_finished) && !g_in_race_lobby.load(std::memory_order_acquire)) {
         ImDrawList* restart_draw = ImGui::GetForegroundDrawList();
         const ImGuiIO& restart_io = ImGui::GetIO();
         const ImVec2 prompt_min(44.0f, restart_io.DisplaySize.y - 108.0f);
@@ -1471,7 +1483,7 @@ static DWORD WINAPI overlay_thread(void*) {
             g_restart_hold_progress.store(progress, std::memory_order_release);
             if (progress >= 1.0f && !restart_latched) {
                 restart_latched = true;
-                if (valid && !g_finished && !g_in_race_lobby.load(std::memory_order_acquire)) dispatch_restart_on_game_thread();
+                if (valid && !g_in_race_lobby.load(std::memory_order_acquire)) dispatch_restart_on_game_thread();
             }
         } else {
             g_restart_hold_progress.store(0.0f, std::memory_order_release);
