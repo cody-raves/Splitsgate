@@ -541,13 +541,15 @@ static void begin_run_comparison() {
 
 static void commit_personal_best(int finish_count) {
     if (g_pb_committed_for_finish || finish_count <= 0) return;
-    g_pb_committed_for_finish = true;
     load_personal_bests();
     const std::string key = profile_key();
     if (g_run_profile_key.empty()) begin_run_comparison();
     for (int ball = 1; ball <= finish_count && ball < static_cast<int>(g_splits.size()); ++ball) {
         if (g_splits[ball] <= 0.0) return;
     }
+    // Do not latch the finish until every split is present. The final count
+    // and the sampler can land on adjacent frames on faster machines.
+    g_pb_committed_for_finish = true;
     const auto previous = g_personal_bests.find(key);
     if (previous != g_personal_bests.end() && g_finish_time >= previous->second.finish) return;
     PersonalBest best;
@@ -1328,9 +1330,6 @@ static HRESULT __stdcall hooked_present(IDXGISwapChain* swap_chain, UINT sync_in
     }
     if (g_imgui_ready.load()) {
         const bool in_lobby = race_lobby_visible(swap_chain);
-        if (in_lobby && (g_race_running || g_finished || g_last_count >= 0 || g_race_object.load())) {
-            reset_run_for_lobby();
-        }
         int finish_count = 0; double finish_clock = 0.0;
         const uintptr_t finish_race = g_race_object.load();
         const bool have_finish_sample = finish_race && race_sample(finish_race, finish_count, finish_clock);
@@ -1358,6 +1357,9 @@ static HRESULT __stdcall hooked_present(IDXGISwapChain* swap_chain, UINT sync_in
             commit_personal_best(finish_count);
         }
         if (g_finished) {
+            // Retry until the independently sampled final split is available.
+            // commit_personal_best remains a no-op once the result is stored.
+            commit_personal_best(g_last_count);
             const bool banner_visible = strict_finish_banner_visible(swap_chain);
             if (banner_visible) {
                 g_finish_banner_seen = true;
@@ -1365,6 +1367,12 @@ static HRESULT __stdcall hooked_present(IDXGISwapChain* swap_chain, UINT sync_in
             } else if (g_finish_banner_seen && ++g_finish_banner_missing_frames >= 3) {
                 reset_run_for_lobby();
             }
+        }
+        // Commit the final native race sample before clearing the retained
+        // object. Some PCs reach the lobby in the same render frame as the
+        // last ball and previously lost the PB before it could be written.
+        if (in_lobby && (g_race_running || g_finished || g_last_count >= 0 || g_race_object.load())) {
+            reset_run_for_lobby();
         }
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
