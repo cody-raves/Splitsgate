@@ -12,6 +12,7 @@ add_library(imgui STATIC
     vendor/imgui/imgui_tables.cpp
     vendor/imgui/imgui_widgets.cpp
     vendor/imgui/backends/imgui_impl_dx11.cpp
+    vendor/imgui/backends/imgui_impl_dx12.cpp
     vendor/imgui/backends/imgui_impl_win32.cpp
 )
 target_include_directories(imgui PUBLIC vendor/imgui vendor/imgui/backends)
@@ -28,11 +29,33 @@ add_custom_command(TARGET SplitgateSplitsOverlay POST_BUILD
         "$<TARGET_FILE_DIR:SplitgateSplitsOverlay>/assets/splitgate-new-s-mark-clean.png"
 )
 
-add_executable(SplitgateOverlayLoader loader.cpp)
+add_executable(EmbedBinary embed_binary.cpp)
+
+set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(OVERLAY_PAYLOAD_CPP "${GENERATED_DIR}/overlay_payload.cpp")
+set(LOGO_PAYLOAD_CPP "${GENERATED_DIR}/logo_payload.cpp")
+add_custom_command(
+    OUTPUT "${OVERLAY_PAYLOAD_CPP}"
+    COMMAND $<TARGET_FILE:EmbedBinary> $<TARGET_FILE:SplitgateSplitsOverlay> "${OVERLAY_PAYLOAD_CPP}" g_bundled_overlay_dll
+    DEPENDS EmbedBinary SplitgateSplitsOverlay
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT "${LOGO_PAYLOAD_CPP}"
+    COMMAND $<TARGET_FILE:EmbedBinary> "${CMAKE_CURRENT_SOURCE_DIR}/assets/splitgate-new-s-mark-clean.png" "${LOGO_PAYLOAD_CPP}" g_bundled_logo_png
+    DEPENDS EmbedBinary "${CMAKE_CURRENT_SOURCE_DIR}/assets/splitgate-new-s-mark-clean.png"
+    VERBATIM
+)
+
+add_executable(SplitgateOverlayLoader loader.cpp "${OVERLAY_PAYLOAD_CPP}" "${LOGO_PAYLOAD_CPP}")
 target_compile_definitions(SplitgateOverlayLoader PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(SplitgateOverlayLoader PRIVATE winhttp)
 
 add_executable(ArenaRaceProbe arena_probe.cpp)
 target_compile_definitions(ArenaRaceProbe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+
+add_executable(SplitgateRaceProbe sg1_probe.cpp)
+target_compile_definitions(SplitgateRaceProbe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 add_executable(ArenaDllLoader arena_dll_loader.cpp)
 target_compile_definitions(ArenaDllLoader PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)

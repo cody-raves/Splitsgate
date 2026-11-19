@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="A beginner-friendly setup guide for the Splitsgate race splits overlay for Splitgate 1 and Splitgate 2.">
+  <meta name="theme-color" content="#071522">
+  <title>Splitsgate — Easy Setup Guide</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="logos.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="#top" aria-label="Splitsgate home"><img class="brand-mark" src="assets/splitgate-mark.png" alt=""><span>Splitsgate</span></a>
+    <nav aria-label="Main navigation">
+      <a href="#setup">Setup</a><a href="#controls">Controls</a><a href="#help">Help</a>
+      <a class="nav-github" href="https://github.com/cody-raves/Splitsgate">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow"><span></span> Splitgate 1 + Splitgate 2</p>
+        <h1>Your race splits.<br><em>Without the setup headache.</em></h1>
+        <p class="lead">Download one zip, start your game, and open one file. Splitsgate tracks your timer, ball splits, deltas, and personal bests automatically.</p>
+        <div class="hero-actions">
+          <a id="download-primary" class="button primary" href="https://github.com/cody-raves/Splitsgate/releases/latest/download/Splitsgate.zip">Download Splitsgate</a>
+          <a class="button secondary" href="#setup">Show me how</a>
+        </div>
+        <p class="release-note"><span id="release-dot"></span><span id="release-label">Windows 10/11 · latest release zip</span></p>
+      </div>
+      <div class="hud-demo" aria-label="Animated example of the Splitsgate overlay">
+        <div class="scan"></div>
+        <div class="game-label">SIMULATION CHARLIE</div>
+        <img class="demo-logo" src="assets/splitgate-mark.png" alt="Splitgate mark">
+        <div class="race-orb"></div>
+        <div class="hud-card">
+          <div class="hud-title"><span>SIMULATION CHARLIE // RACE</span><b>04 / 15</b></div>
+          <div class="yellow-rule"></div>
+          <div class="hud-time">0:07.140</div>
+          <div class="hud-cols"><span>BALL</span><span>SPLIT</span><span>DELTA</span></div>
+          <div class="split"><b>01</b><span>0:01.530</span><i class="bad">+0.100</i></div>
+          <div class="split"><b>02</b><span>0:02.130</span><i>+0.000</i></div>
+          <div class="split"><b>03</b><span>0:02.730</span><i class="bad">+0.090</i></div>
+          <div class="split current"><b>04</b><span>0:02.930</span><i>-0.210</i></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="trust-strip" aria-label="Product highlights">
+      <div><strong>ONE DOWNLOAD</strong><span>DLL and logo are built in</span></div>
+      <div><strong>AUTO-DETECT</strong><span>Works with either game</span></div>
+      <div><strong>SAFE SAVES</strong><span>PBs survive every update</span></div>
+    </section>
+
+    <section id="setup" class="section setup">
+      <div class="section-heading">
+        <p class="eyebrow"><span></span> Setup guide for absolute beginners</p>
+        <h2>Three steps. That’s it.</h2>
+        <p>You do not need to install a mod manager, move a DLL, or edit a config file.</p>
+      </div>
+
+      <div class="tutorial">
+        <div class="tutorial-stage" aria-live="polite">
+          <div class="desktop-grid"></div>
+          <div class="scene scene-download active" data-scene="0">
+            <div class="browser-window">
+              <div class="window-bar"><i></i><i></i><i></i><span>Downloads</span></div>
+              <div class="download-file"><span class="zip-icon">ZIP</span><div><b>Splitsgate.zip</b><small>GitHub release</small></div><em>✓</em></div>
+              <div class="cursor cursor-one"></div>
+            </div>
+          </div>
+          <div class="scene scene-game" data-scene="1">
+            <div class="game-window"><div class="game-logo"><img src="assets/splitgate-mark.png" alt=""><strong>SPLITGATE</strong></div><p>Start the game and wait for the menu.</p><div class="status-pill">GAME RUNNING</div></div>
+            <div class="cursor cursor-two"></div>
+          </div>
+          <div class="scene scene-launch" data-scene="2">
+            <div class="folder-window">
+              <div class="window-bar"><i></i><i></i><i></i><span>Splitsgate</span></div>
+              <div class="exe-file"><span class="exe-icon"><img src="assets/splitgate-mark.png" alt=""></span><b>Splitsgate.exe</b><small>Double-click</small></div>
+              <div class="mini-overlay">HUD LOADED <span>✓</span></div>
+            </div>
+            <div class="cursor cursor-three"></div>
+          </div>
+        </div>
+
+        <div class="tutorial-steps" role="tablist" aria-label="Setup tutorial steps">
+          <button class="tutorial-step active" data-step="0" role="tab" aria-selected="true"><b>1</b><span><strong>Download and unzip</strong><small>Click Download above, then extract <code>Splitsgate.zip</code>.</small></span></button>
+          <button class="tutorial-step" data-step="1" role="tab" aria-selected="false"><b>2</b><span><strong>Start your game</strong><small>Open Splitgate 1 or Splitgate 2 normally.</small></span></button>
+          <button class="tutorial-step" data-step="2" role="tab" aria-selected="false"><b>3</b><span><strong>Open Splitsgate.exe</strong><small>Use the dual launcher. The HUD appears automatically.</small></span></button>
+          <button id="tutorial-toggle" class="pause" type="button" aria-label="Pause animated tutorial">Pause animation</button>
+        </div>
+      </div>
+
+      <aside class="windows-note"><b>Windows protected your PC?</b><span>Click <strong>More info</strong>, then <strong>Run anyway</strong>. Windows may show this because Splitsgate is a small community tool, not because setup requires extra files.</span></aside>
+    </section>
+
+    <section class="section launchers">
+      <div class="section-heading compact"><p class="eyebrow"><span></span> Inside the zip</p><h2>Which launcher do I use?</h2></div>
+      <div class="launcher-grid">
+        <article class="launcher recommended"><img class="launcher-logo" src="assets/splitgate-mark.png" alt=""><span class="tag">RECOMMENDED</span><h3>Splitsgate.exe</h3><p>Automatically finds Splitgate 1 or Splitgate 2. This is the right choice for almost everyone.</p></article>
+        <article class="launcher"><img class="launcher-logo" src="assets/splitgate-mark.png" alt=""><span class="game-number">01</span><h3>Splitsgate-Splitgate1.exe</h3><p>Only looks for the original Splitgate. Useful if both games happen to be open.</p></article>
+        <article class="launcher"><img class="launcher-logo" src="assets/splitgate-mark.png" alt=""><span class="game-number">02</span><h3>Splitsgate-Splitgate2.exe</h3><p>Only looks for Splitgate 2. It uses the same settings and PB storage.</p></article>
+      </div>
+    </section>
+
+    <section id="controls" class="section controls">
+      <div class="section-heading compact"><p class="eyebrow"><span></span> In-game controls</p><h2>Two things to remember.</h2></div>
+      <div class="control-grid">
+        <article><div class="key"><span>HOLD</span>R</div><div><h3>Restart the race</h3><p>Hold R until the small progress bar fills. Release early to cancel.</p></div></article>
+        <article><div class="key"><span>2×</span>R</div><div><h3>Open settings</h3><p>Tap R twice quickly to move, resize, recolor, or unload the HUD.</p></div></article>
+      </div>
+    </section>
+
+    <section class="section saves">
+      <div><p class="eyebrow"><span></span> Your data</p><h2>Updates do not erase your PBs.</h2><p>The launcher is one downloadable EXE, but your writable personal-best and settings files live safely in your Windows profile.</p></div>
+      <div class="path-card"><span>Saved automatically in</span><code>%LOCALAPPDATA%\Splitsgate\Runtime</code><ul><li>splitgate-personal-bests.tsv</li><li>splitgate-overlay-settings.ini</li></ul></div>
+    </section>
+
+    <section id="help" class="section help">
+      <div class="section-heading compact"><p class="eyebrow"><span></span> Quick fixes</p><h2>If something doesn’t work.</h2></div>
+      <div class="faq">
+        <details><summary>The HUD did not appear.<span>+</span></summary><p>Make sure the game is already running, then open the launcher again. Use the dual <code>Splitsgate.exe</code> unless you have a specific reason not to.</p></details>
+        <details><summary>I downloaded an update. What happens next?<span>+</span></summary><p>On launch, Splitsgate checks GitHub. If you approve a new version, it downloads the matching EXE, replaces itself, relaunches, and then loads the HUD. It never interrupts a race.</p></details>
+        <details><summary>How do I remove the overlay?<span>+</span></summary><p>Press <code>End</code> in-game, or double-tap R and choose <strong>Unload Overlay</strong>. Closing the game also unloads it.</p></details>
+        <details><summary>Where can I report a bug?<span>+</span></summary><p>Open an issue on <a href="https://github.com/cody-raves/Splitsgate/issues">GitHub Issues</a> and include the game, map, difficulty, and a screenshot.</p></details>
+      </div>
+    </section>
+
+    <section class="final-cta"><p>Ready to race?</p><h2>Download once. Chase every split.</h2><a class="button primary download-mirror" href="https://github.com/cody-raves/Splitsgate/releases/latest/download/Splitsgate.zip">Download Splitsgate</a></section>
+  </main>
+
+  <footer><span>Splitsgate is an independent community project and is not affiliated with 1047 Games.</span><a href="https://github.com/cody-raves/Splitsgate/releases/latest">Release notes</a></footer>
+  <script src="app.js"></script>
+</body>
+</html>

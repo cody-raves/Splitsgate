@@ -1,6 +1,11 @@
 # Splitsgate
 
-Splitsgate is a native Windows race-splits overlay for Splitgate. It reads the game's race state directly and displays a compact in-game timer with per-ball splits, personal-best comparisons, and a hold-to-restart shortcut.
+**[Download Splitsgate](https://github.com/cody-raves/Splitsgate/releases/latest/download/Splitsgate.zip)** ·
+**[Beginner setup guide](https://cody-raves.github.io/Splitsgate/)**
+
+Splitsgate is a native Windows race-splits overlay for **Splitgate 1 and
+Splitgate 2**. It reads the game's race state directly and displays a compact
+in-game timer with per-ball splits and personal-best comparisons.
 
 ## Features
 
@@ -10,12 +15,16 @@ Splitsgate is a native Windows race-splits overlay for Splitgate. It reads the g
 - Automatic map and difficulty detection in the race lobby
 - Clean lobby reset between runs
 - Hold `R` to restart the active race
-- Press `` ` `` to open settings and change the restart key
+- Double-tap `R` to open settings, or press `` ` `` as a fallback
+- Move, resize, and recolor the HUD
+- Automatic update notifications on launcher startup
 - Restart and pre-race countdown filtering so the timer begins at the game's real zero
 
 ## Compatibility
 
-This project targets the current 64-bit Windows build using `PortalWars-Win64-Shipping.exe`. It relies on game-specific native offsets, so a future game update may require the constants in `overlay.cpp` to be updated.
+This project targets the current 64-bit Windows builds of both games. It relies
+on game-specific native state, so a future game update may require an overlay
+update.
 
 ## Building
 
@@ -34,20 +43,25 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-The build produces:
-
-- `build/Release/SplitgateSplitsOverlay.dll`
-- `build/Release/SplitgateOverlayLoader.exe`
-- `build/Release/assets/splitgate-new-s-mark-clean.png`
+The build creates a self-contained launcher. The overlay DLL and logo are
+embedded in the EXE and prepared automatically when it runs.
 
 ## Running
 
-1. Keep the loader, DLL, and `assets` folder together.
-2. Start Splitgate and enter the race lobby.
-3. Run `SplitgateOverlayLoader.exe`.
+1. Download and extract `Splitsgate.zip` from the latest release.
+2. Start Splitgate 1 or Splitgate 2.
+3. Run `Splitsgate.exe` (the recommended dual-game launcher).
 4. Press `End` in game to unload the overlay.
 
-Personal-best data is saved beside the DLL as `splitgate-personal-bests.tsv`. That file is ignored by Git.
+The zip also contains `Splitsgate-Splitgate1.exe` and
+`Splitsgate-Splitgate2.exe` for users who want a game-specific launcher. All
+three EXEs contain the same overlay and share the same settings and PB files.
+
+Personal-best data and settings are kept in `%LOCALAPPDATA%\Splitsgate\Runtime`.
+On startup, the launcher checks the latest GitHub release. If a newer version
+is available, it offers to download, replace, and relaunch the single EXE
+before loading the overlay. Release builds should attach `Splitsgate.exe` as a
+GitHub release asset; zip assets remain supported for older releases.
 
 ## Third-party software
 

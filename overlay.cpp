@@ -17,6 +17,7 @@
 #include <cctype>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -24,6 +25,7 @@
 #include "MinHook.h"
 #include "imgui.h"
 #include "backends/imgui_impl_dx11.h"
+#include "backends/imgui_impl_dx12.h"
 #include "backends/imgui_impl_win32.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
@@ -51,6 +53,24 @@ static UINT g_arena_readback_width = 0;
 static UINT g_arena_readback_height = 0;
 static UINT g_arena_readback_pitch = 0;
 static DXGI_FORMAT g_arena_readback_format = DXGI_FORMAT_UNKNOWN;
+struct ArenaRenderFrame {
+    ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12Resource* target = nullptr;
+    UINT64 fence_value = 0;
+};
+static IDXGISwapChain3* g_arena_swap_chain = nullptr;
+static ID3D12DescriptorHeap* g_arena_rtv_heap = nullptr;
+static ID3D12DescriptorHeap* g_arena_srv_heap = nullptr;
+static ID3D12GraphicsCommandList* g_arena_render_list = nullptr;
+static ID3D12Fence* g_arena_render_fence = nullptr;
+static HANDLE g_arena_render_event = nullptr;
+static UINT64 g_arena_render_fence_value = 0;
+static UINT g_arena_rtv_stride = 0;
+static UINT g_arena_srv_stride = 0;
+static std::vector<ArenaRenderFrame> g_arena_render_frames;
+static bool g_arena_srv_allocated = false;
+static ID3D12Resource* g_arena_logo_resource = nullptr;
+static D3D12_GPU_DESCRIPTOR_HANDLE g_arena_logo_gpu{};
 static RestartRaceFn g_original_restart_race = nullptr;
 static RestartVisibilityFn g_original_restart_visibility = nullptr;
 static DifficultySelectedFn g_original_difficulty_selected = nullptr;
@@ -72,6 +92,7 @@ static std::atomic_bool g_restart_key_down = false;
 static std::atomic_bool g_settings_open = false;
 static std::atomic_bool g_settings_key_down = false;
 static std::atomic_bool g_rebind_listening = false;
+static std::atomic_bool g_unload_requested = false;
 static std::atomic_uint g_restart_virtual_key = 'R';
 static std::atomic_bool g_imgui_ready = false;
 static HMODULE g_module = nullptr;
@@ -116,6 +137,23 @@ static std::atomic_int g_arena_count = 0;
 static std::atomic_int g_arena_total = 0;
 static std::atomic_bool g_arena_hud_valid = false;
 static bool g_arena_pixels_r10 = false;
+static std::chrono::steady_clock::time_point g_last_arena_map_read{};
+static uintptr_t g_arena_map_label = 0;
+static std::mutex g_arena_map_mutex;
+static std::string g_arena_pending_map;
+static float g_arena_panel_x = 36.0f;
+static float g_arena_panel_y = 250.0f;
+static bool g_arena_hide_outside_race = false;
+static float g_sg1_panel_x = -1.0f;
+static float g_sg1_panel_y = 250.0f;
+static float g_arena_hud_scale = 1.0f;
+static float g_sg1_hud_scale = 1.0f;
+static float g_arena_text_scale = 1.0f;
+static float g_sg1_text_scale = 1.0f;
+static float g_theme_background[4] = {3.0f / 255.0f, 17.0f / 255.0f, 29.0f / 255.0f, 225.0f / 255.0f};
+static float g_theme_border[4] = {10.0f / 255.0f, 38.0f / 255.0f, 58.0f / 255.0f, 1.0f};
+static float g_theme_cyan[4] = {112.0f / 255.0f, 229.0f / 255.0f, 1.0f, 1.0f};
+static float g_theme_yellow[4] = {244.0f / 255.0f, 213.0f / 255.0f, 44.0f / 255.0f, 1.0f};
 
 // PortalWars-Win64-Shipping.exe 2026 race pause-menu handler. Keeping this as
 // an RVA makes it independent of ASLR; the hook is also a useful guard against
@@ -126,7 +164,8 @@ constexpr uintptr_t RESTART_WIDGET_VTABLE_RVA = 0x4393540;
 constexpr uintptr_t DIFFICULTY_SELECTED_RVA = 0x137BBA0;
 constexpr uintptr_t MAP_SELECTED_EXEC_RVA = 0x14681C0;
 constexpr UINT RESTART_WINDOW_MESSAGE = WM_APP + 0x247;
-constexpr float RESTART_HOLD_SECONDS = 0.85f;
+constexpr float RESTART_HOLD_SECONDS = 0.45f;
+constexpr auto SETTINGS_DOUBLE_TAP_WINDOW = std::chrono::milliseconds(325);
 static bool readable_address(uintptr_t address, size_t size);
 
 static const std::array<const char*, 14> LIVE_MAP_NAMES = {
@@ -323,20 +362,43 @@ static void capture_restart_controller(void* widget) {
 }
 
 static uintptr_t restart_controller_from_world_context(uintptr_t context) {
-    if (!context || !readable_address(context, sizeof(uintptr_t))) return 0;
-    uintptr_t vtable = 0;
-    std::memcpy(&vtable, reinterpret_cast<void*>(context), sizeof(vtable));
-    if (!readable_address(vtable + 0x160, sizeof(uintptr_t))) return 0;
-    uintptr_t getter_address = 0;
-    std::memcpy(&getter_address, reinterpret_cast<void*>(vtable + 0x160), sizeof(getter_address));
-    if (!getter_address) return 0;
-    using WorldGetterFn = void*(__fastcall*)(void*);
-    void* world = reinterpret_cast<WorldGetterFn>(getter_address)(reinterpret_cast<void*>(context));
-    const uintptr_t world_address = reinterpret_cast<uintptr_t>(world);
-    if (!world_address || !readable_address(world_address + 0x118, sizeof(uintptr_t))) return 0;
-    uintptr_t controller = 0;
-    std::memcpy(&controller, reinterpret_cast<void*>(world_address + 0x118), sizeof(controller));
-    return controller && readable_address(controller, sizeof(uintptr_t)) ? controller : 0;
+    // This is the controller path used by the known-good GitHub build. Keep
+    // the pointer walk contained because a queued window message can otherwise
+    // outlive the race UObject during a finish/lobby transition.
+    __try {
+        if (!context || !readable_address(context, sizeof(uintptr_t))) return 0;
+        uintptr_t vtable = 0;
+        std::memcpy(&vtable, reinterpret_cast<void*>(context), sizeof(vtable));
+        if (!readable_address(vtable + 0x160, sizeof(uintptr_t))) return 0;
+        uintptr_t getter_address = 0;
+        std::memcpy(&getter_address, reinterpret_cast<void*>(vtable + 0x160), sizeof(getter_address));
+        if (!getter_address) return 0;
+        using WorldGetterFn = void*(__fastcall*)(void*);
+        void* world = reinterpret_cast<WorldGetterFn>(getter_address)(reinterpret_cast<void*>(context));
+        const uintptr_t world_address = reinterpret_cast<uintptr_t>(world);
+        if (!world_address || !readable_address(world_address + 0x118, sizeof(uintptr_t))) return 0;
+        uintptr_t controller = 0;
+        std::memcpy(&controller, reinterpret_cast<void*>(world_address + 0x118), sizeof(controller));
+        return controller && readable_address(controller, sizeof(uintptr_t)) ? controller : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+static bool invoke_restart_controller(uintptr_t controller) {
+    __try {
+        if (!controller || !readable_address(controller, sizeof(uintptr_t))) return false;
+        uintptr_t vtable = 0;
+        std::memcpy(&vtable, reinterpret_cast<void*>(controller), sizeof(vtable));
+        uintptr_t restart_method = 0;
+        if (readable_address(vtable + 0x858, sizeof(uintptr_t)))
+            std::memcpy(&restart_method, reinterpret_cast<void*>(vtable + 0x858), sizeof(restart_method));
+        if (!restart_method) return false;
+        reinterpret_cast<void(__fastcall*)(void*)>(restart_method)(reinterpret_cast<void*>(controller));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 static void __fastcall hooked_restart_race(void* widget) {
@@ -357,6 +419,8 @@ static uintptr_t find_current_restart_widget() {
     const uintptr_t wanted_vtable = image + RESTART_WIDGET_VTABLE_RVA;
     uintptr_t best = 0;
     int best_internal_index = -1;
+    constexpr size_t chunk_size = 1u << 20;
+    std::vector<uint8_t> snapshot(chunk_size + 0x28);
     uintptr_t address = 0x10000;
     MEMORY_BASIC_INFORMATION mbi{};
     while (VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi))) {
@@ -367,22 +431,33 @@ static uintptr_t find_current_restart_widget() {
         if (readable && mbi.RegionSize <= (256ull << 20)) {
             const uintptr_t begin = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
             const uintptr_t end = begin + mbi.RegionSize;
-            for (uintptr_t candidate = begin; candidate + 0x28 <= end; candidate += sizeof(uintptr_t)) {
-                uintptr_t vtable = 0;
-                std::memcpy(&vtable, reinterpret_cast<void*>(candidate), sizeof(vtable));
-                if (vtable != wanted_vtable) continue;
-                uint32_t flags = 0;
-                int internal_index = -1;
-                uintptr_t object_class = 0;
-                std::memcpy(&flags, reinterpret_cast<void*>(candidate + 0x8), sizeof(flags));
-                std::memcpy(&internal_index, reinterpret_cast<void*>(candidate + 0xC), sizeof(internal_index));
-                std::memcpy(&object_class, reinterpret_cast<void*>(candidate + 0x10), sizeof(object_class));
-                constexpr uint32_t destroyed_flags = 0x00008000u | 0x00010000u;
-                if ((flags & destroyed_flags) || internal_index < 0 || !readable_address(object_class, sizeof(uintptr_t))) continue;
-                if (internal_index > best_internal_index) {
-                    best = candidate;
-                    best_internal_index = internal_index;
+            for (uintptr_t chunk = begin; chunk < end;) {
+                const size_t requested = static_cast<size_t>(std::min<uintptr_t>(chunk_size, end - chunk));
+                SIZE_T received = 0;
+                if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(chunk),
+                        snapshot.data(), requested, &received) && received >= 0x28) {
+                    for (size_t offset = 0; offset + 0x28 <= received; offset += sizeof(uintptr_t)) {
+                        uintptr_t vtable = 0;
+                        std::memcpy(&vtable, snapshot.data() + offset, sizeof(vtable));
+                        if (vtable != wanted_vtable) continue;
+                        uint32_t flags = 0;
+                        int internal_index = -1;
+                        uintptr_t object_class = 0;
+                        std::memcpy(&flags, snapshot.data() + offset + 0x8, sizeof(flags));
+                        std::memcpy(&internal_index, snapshot.data() + offset + 0xC, sizeof(internal_index));
+                        std::memcpy(&object_class, snapshot.data() + offset + 0x10, sizeof(object_class));
+                        constexpr uint32_t destroyed_flags = 0x00008000u | 0x00010000u;
+                        if ((flags & destroyed_flags) || internal_index < 0 ||
+                            !readable_address(object_class, sizeof(uintptr_t))) continue;
+                        if (internal_index > best_internal_index) {
+                            best = chunk + offset;
+                            best_internal_index = internal_index;
+                        }
+                    }
                 }
+                const uintptr_t next_chunk = chunk + requested;
+                if (next_chunk <= chunk) break;
+                chunk = next_chunk;
             }
         }
         const uintptr_t next = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
@@ -406,7 +481,27 @@ static void handle_overlay_key(UINT virtual_key, bool released) {
         return;
     }
     if (virtual_key == g_restart_virtual_key.load(std::memory_order_acquire)) {
-        g_restart_key_down.store(!released, std::memory_order_release);
+        static bool physical_restart_key_down = false;
+        static std::chrono::steady_clock::time_point last_restart_tap{};
+        if (released) {
+            physical_restart_key_down = false;
+            g_restart_key_down.store(false, std::memory_order_release);
+            return;
+        }
+        // WM_INPUT and WM_KEYDOWN can both report the same physical press.
+        // Count only the first edge so it cannot look like a false double tap.
+        if (physical_restart_key_down) return;
+        physical_restart_key_down = true;
+        const auto now = std::chrono::steady_clock::now();
+        if (last_restart_tap.time_since_epoch().count() && now - last_restart_tap <= SETTINGS_DOUBLE_TAP_WINDOW) {
+            last_restart_tap = {};
+            g_restart_key_down.store(false, std::memory_order_release);
+            g_restart_hold_progress.store(0.0f, std::memory_order_release);
+            g_settings_open.store(!g_settings_open.load(std::memory_order_acquire), std::memory_order_release);
+            return;
+        }
+        last_restart_tap = now;
+        g_restart_key_down.store(true, std::memory_order_release);
     }
 }
 
@@ -431,18 +526,28 @@ static LRESULT CALLBACK overlay_wndproc(HWND window, UINT message, WPARAM wparam
     } else if (message == WM_KILLFOCUS) {
         g_restart_key_down.store(false, std::memory_order_release);
     } else if (message == RESTART_WINDOW_MESSAGE) {
-        // Resolve from the active race every time. A controller from the last
-        // race can remain readable after returning to the lobby, but invoking
-        // it only starts working again after the pause menu refreshes it.
-        uintptr_t controller = restart_controller_from_world_context(g_race_object.load(std::memory_order_acquire));
-        if (controller) g_restart_controller.store(controller, std::memory_order_release);
+        uintptr_t controller = 0;
+        if (!g_finished && !g_in_race_lobby.load(std::memory_order_acquire)) {
+            controller = restart_controller_from_world_context(g_race_object.load(std::memory_order_acquire));
+            if (controller) g_restart_controller.store(controller, std::memory_order_release);
+        }
         uintptr_t widget = g_restart_widget.load(std::memory_order_acquire);
         uintptr_t widget_vtable = 0;
         if (widget && readable_address(widget, sizeof(widget_vtable))) {
             std::memcpy(&widget_vtable, reinterpret_cast<void*>(widget), sizeof(widget_vtable));
         }
         const uintptr_t expected_widget_vtable = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + RESTART_WIDGET_VTABLE_RVA;
-        if (widget_vtable != expected_widget_vtable) {
+        uint32_t widget_flags = 0;
+        int widget_internal_index = -1;
+        uintptr_t widget_class = 0;
+        if (widget && readable_address(widget + 0x8, 0x10)) {
+            std::memcpy(&widget_flags, reinterpret_cast<void*>(widget + 0x8), sizeof(widget_flags));
+            std::memcpy(&widget_internal_index, reinterpret_cast<void*>(widget + 0xC), sizeof(widget_internal_index));
+            std::memcpy(&widget_class, reinterpret_cast<void*>(widget + 0x10), sizeof(widget_class));
+        }
+        constexpr uint32_t destroyed_widget_flags = 0x00008000u | 0x00010000u;
+        if (widget_vtable != expected_widget_vtable || (widget_flags & destroyed_widget_flags) ||
+            widget_internal_index < 0 || !readable_address(widget_class, sizeof(uintptr_t))) {
             // Never scan the full UObject address space from this window
             // callback: it runs on the game thread and visibly stalls the
             // simulation. A widget captured by the normal game hooks is safe;
@@ -457,17 +562,10 @@ static LRESULT CALLBACK overlay_wndproc(HWND window, UINT message, WPARAM wparam
         if (widget && g_original_restart_race) {
             g_restart_transition_pending.store(true, std::memory_order_release);
             g_original_restart_race(reinterpret_cast<void*>(widget));
-        } else if (controller && readable_address(controller, sizeof(uintptr_t))) {
-            uintptr_t vtable = 0;
-            std::memcpy(&vtable, reinterpret_cast<void*>(controller), sizeof(vtable));
-            uintptr_t restart_method = 0;
-            if (readable_address(vtable + 0x858, sizeof(uintptr_t))) {
-                std::memcpy(&restart_method, reinterpret_cast<void*>(vtable + 0x858), sizeof(restart_method));
-            }
-            if (restart_method) {
-                g_restart_transition_pending.store(true, std::memory_order_release);
-                reinterpret_cast<void(__fastcall*)(void*)>(restart_method)(reinterpret_cast<void*>(controller));
-            }
+        } else if (controller) {
+            g_restart_transition_pending.store(true, std::memory_order_release);
+            if (!invoke_restart_controller(controller))
+                g_restart_transition_pending.store(false, std::memory_order_release);
         }
         return 0;
     }
@@ -501,7 +599,7 @@ static bool g_current_run_is_pb = false;
 struct RaceTotalEntry { const char* map; const char* difficulty; int total; };
 static constexpr RaceTotalEntry k_race_totals[] = {
     {"ABYSS", "EASY", 19}, {"ABYSS", "MEDIUM", 25}, {"ABYSS", "HARD", 22},
-    {"ATLANTIS", "EASY", 24}, {"ATLANTIS", "MEDIUM", 24}, {"ATLANTIS", "HARD", 25},
+    {"ATLANTIS", "EASY", 24}, {"ATLANTIS", "MEDIUM", 24}, {"ATLANTIS", "HARD", 29},
     {"CRAG", "EASY", 24}, {"CRAG", "MEDIUM", 16}, {"CRAG", "HARD", 25},
     {"CLUB SILO", "EASY", 19}, {"CLUB SILO", "MEDIUM", 19}, {"CLUB SILO", "HARD", 25},
     {"FOREGONE DESTRUCTION", "EASY", 18}, {"FOREGONE DESTRUCTION", "MEDIUM", 20}, {"FOREGONE DESTRUCTION", "HARD", 25},
@@ -526,6 +624,66 @@ static std::wstring personal_best_path() {
     wchar_t* slash = wcsrchr(path, L'\\');
     if (slash) *(slash + 1) = L'\0';
     return std::wstring(path) + L"splitgate-personal-bests.tsv";
+}
+
+static std::wstring overlay_settings_path() {
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(g_module, path, MAX_PATH)) return L"splitgate-overlay-settings.ini";
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    return std::wstring(path) + L"splitgate-overlay-settings.ini";
+}
+
+static void load_overlay_settings() {
+    std::ifstream input(overlay_settings_path());
+    std::string line;
+    while (std::getline(input, line)) {
+        const size_t separator = line.find('=');
+        if (separator == std::string::npos) continue;
+        const std::string key = line.substr(0, separator);
+        const std::string value = line.substr(separator + 1);
+        if (key == "arena_panel_x") g_arena_panel_x = std::strtof(value.c_str(), nullptr);
+        else if (key == "arena_panel_y") g_arena_panel_y = std::strtof(value.c_str(), nullptr);
+        else if (key == "arena_hide_outside_race") g_arena_hide_outside_race = std::atoi(value.c_str()) != 0;
+        else if (key == "sg1_panel_x") g_sg1_panel_x = std::strtof(value.c_str(), nullptr);
+        else if (key == "sg1_panel_y") g_sg1_panel_y = std::strtof(value.c_str(), nullptr);
+        else if (key == "arena_hud_scale" || key == "arena_minimal_scale") g_arena_hud_scale = std::strtof(value.c_str(), nullptr);
+        else if (key == "sg1_hud_scale" || key == "sg1_minimal_scale") g_sg1_hud_scale = std::strtof(value.c_str(), nullptr);
+        else if (key == "arena_text_scale" || key == "arena_minimal_text_scale") g_arena_text_scale = std::strtof(value.c_str(), nullptr);
+        else if (key == "sg1_text_scale" || key == "sg1_minimal_text_scale") g_sg1_text_scale = std::strtof(value.c_str(), nullptr);
+        else if (key == "theme_background") std::sscanf(value.c_str(), "%f,%f,%f,%f", &g_theme_background[0], &g_theme_background[1], &g_theme_background[2], &g_theme_background[3]);
+        else if (key == "theme_border") std::sscanf(value.c_str(), "%f,%f,%f,%f", &g_theme_border[0], &g_theme_border[1], &g_theme_border[2], &g_theme_border[3]);
+        else if (key == "theme_cyan") std::sscanf(value.c_str(), "%f,%f,%f,%f", &g_theme_cyan[0], &g_theme_cyan[1], &g_theme_cyan[2], &g_theme_cyan[3]);
+        else if (key == "theme_yellow") std::sscanf(value.c_str(), "%f,%f,%f,%f", &g_theme_yellow[0], &g_theme_yellow[1], &g_theme_yellow[2], &g_theme_yellow[3]);
+    }
+    if (!std::isfinite(g_arena_panel_x)) g_arena_panel_x = 36.0f;
+    if (!std::isfinite(g_arena_panel_y)) g_arena_panel_y = 250.0f;
+    if (!std::isfinite(g_sg1_panel_x)) g_sg1_panel_x = -1.0f;
+    if (!std::isfinite(g_sg1_panel_y)) g_sg1_panel_y = 250.0f;
+    g_arena_hud_scale = std::clamp(g_arena_hud_scale, 0.60f, 1.80f);
+    g_sg1_hud_scale = std::clamp(g_sg1_hud_scale, 0.60f, 1.80f);
+    g_arena_text_scale = std::clamp(g_arena_text_scale, 0.75f, 1.50f);
+    g_sg1_text_scale = std::clamp(g_sg1_text_scale, 0.75f, 1.50f);
+    for (float* color : {g_theme_background, g_theme_border, g_theme_cyan, g_theme_yellow}) {
+        for (int channel = 0; channel < 4; ++channel) color[channel] = std::clamp(color[channel], 0.0f, 1.0f);
+    }
+}
+
+static void save_overlay_settings() {
+    std::ofstream output(overlay_settings_path(), std::ios::trunc);
+    output << "arena_panel_x=" << g_arena_panel_x << '\n'
+           << "arena_panel_y=" << g_arena_panel_y << '\n'
+           << "arena_hide_outside_race=" << (g_arena_hide_outside_race ? 1 : 0) << '\n'
+           << "sg1_panel_x=" << g_sg1_panel_x << '\n'
+           << "sg1_panel_y=" << g_sg1_panel_y << '\n'
+           << "arena_hud_scale=" << g_arena_hud_scale << '\n'
+           << "sg1_hud_scale=" << g_sg1_hud_scale << '\n'
+           << "arena_text_scale=" << g_arena_text_scale << '\n'
+           << "sg1_text_scale=" << g_sg1_text_scale << '\n'
+           << "theme_background=" << g_theme_background[0] << ',' << g_theme_background[1] << ',' << g_theme_background[2] << ',' << g_theme_background[3] << '\n'
+           << "theme_border=" << g_theme_border[0] << ',' << g_theme_border[1] << ',' << g_theme_border[2] << ',' << g_theme_border[3] << '\n'
+           << "theme_cyan=" << g_theme_cyan[0] << ',' << g_theme_cyan[1] << ',' << g_theme_cyan[2] << ',' << g_theme_cyan[3] << '\n'
+           << "theme_yellow=" << g_theme_yellow[0] << ',' << g_theme_yellow[1] << ',' << g_theme_yellow[2] << ',' << g_theme_yellow[3] << '\n';
 }
 
 static void load_personal_bests() {
@@ -587,6 +745,10 @@ static void commit_personal_best(int finish_count) {
     const std::string key = profile_key();
     if (g_run_profile_key.empty()) begin_run_comparison();
     for (int ball = 1; ball <= finish_count && ball < static_cast<int>(g_splits.size()); ++ball) {
+        if (g_splits[ball] <= 0.0) {
+            const double sampled = g_sampled_splits[ball].load(std::memory_order_acquire);
+            if (sampled > 0.0) g_splits[ball] = sampled;
+        }
         if (g_splits[ball] <= 0.0) return;
     }
     // Do not latch the finish until every split is present. The final count
@@ -638,6 +800,175 @@ static void refresh_race_profile() {
     fclose(file);
 }
 
+static std::string compact_profile_label(std::string value) {
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) {
+        return !std::isalnum(c);
+    }), value.end());
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    return value;
+}
+
+static void refresh_profile_from_game_log() {
+    wchar_t local_app_data[MAX_PATH]{};
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH)) return;
+    wchar_t path[MAX_PATH]{};
+    _snwprintf_s(path, _TRUNCATE, L"%s\\PortalWars\\Saved\\Logs\\PortalWars.log", local_app_data);
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path, L"r") != 0 || !file) return;
+
+    std::string detected_map;
+    std::string detected_difficulty;
+    char line[1024]{};
+    while (fgets(line, sizeof(line), file)) {
+        if (const char* marker = std::strstr(line, "/Game/Maps/")) {
+            marker += std::strlen("/Game/Maps/");
+            const size_t length = std::strcspn(marker, ".? \r\n");
+            const std::string asset(marker, length);
+            const std::string compact_asset = compact_profile_label(asset);
+            for (const char* name : LIVE_MAP_NAMES) {
+                if (compact_profile_label(name) == compact_asset) {
+                    detected_map = name;
+                    break;
+                }
+            }
+        }
+        if (std::strstr(line, "_RaceEasy")) detected_difficulty = "EASY";
+        else if (std::strstr(line, "_RaceMedium")) detected_difficulty = "MEDIUM";
+        else if (std::strstr(line, "_RaceHard")) detected_difficulty = "HARD";
+    }
+    fclose(file);
+    if (!detected_map.empty()) g_map_name = detected_map;
+    if (!detected_difficulty.empty()) g_difficulty = detected_difficulty;
+    if (!detected_map.empty() && !detected_difficulty.empty())
+        g_live_profile_seen.store(true, std::memory_order_release);
+}
+
+static bool read_arena_map_label(uintptr_t address, std::string& name) {
+    if (!address) return false;
+    char stored[96]{};
+    SIZE_T bytes_read = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), stored,
+            sizeof(stored) - 1, &bytes_read) || bytes_read < 7) return false;
+    const bool ascii = std::memcmp(stored, "MAP: ", 5) == 0;
+    const char wide_marker[] = {'M', 0, 'A', 0, 'P', 0, ':', 0, ' ', 0};
+    const bool wide = bytes_read >= sizeof(wide_marker) && std::memcmp(stored, wide_marker, sizeof(wide_marker)) == 0;
+    if (!ascii && !wide) return false;
+    const size_t prefix = wide ? sizeof(wide_marker) : 5;
+    const size_t stride = wide ? 2 : 1;
+    size_t length = 0;
+    while (prefix + length * stride < bytes_read && length < 80) {
+        const unsigned char c = static_cast<unsigned char>(stored[prefix + length * stride]);
+        if (wide && prefix + length * stride + 1 < bytes_read && stored[prefix + length * stride + 1] != 0) break;
+        if (!(std::isalnum(c) || c == ' ' || c == '-' || c == '_' || c == '(' || c == ')' || c == '\'')) break;
+        ++length;
+    }
+    while (length && stored[prefix + (length - 1) * stride] == ' ') --length;
+    if (length < 2) return false;
+    name.clear();
+    name.reserve(length);
+    for (size_t i = 0; i < length; ++i) name.push_back(stored[prefix + i * stride]);
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    return true;
+}
+
+static bool scan_arena_map_label(std::string& name) {
+    if (read_arena_map_label(g_arena_map_label, name)) return true;
+    g_arena_map_label = 0;
+    SYSTEM_INFO system{};
+    GetNativeSystemInfo(&system);
+    uintptr_t address = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
+    const uintptr_t maximum = reinterpret_cast<uintptr_t>(system.lpMaximumApplicationAddress);
+    MEMORY_BASIC_INFORMATION mbi{};
+    while (address < maximum && VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi))) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        const size_t size = mbi.RegionSize;
+        const DWORD protection = mbi.Protect & 0xff;
+        const bool readable = protection == PAGE_READONLY || protection == PAGE_READWRITE ||
+            protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_READ ||
+            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+        if (mbi.State == MEM_COMMIT && readable && !(mbi.Protect & PAGE_GUARD) && size >= 7) {
+            constexpr size_t chunk_size = 1024 * 1024;
+            std::vector<char> buffer(chunk_size + 4);
+            for (size_t offset = 0; offset < size; offset += chunk_size) {
+                const size_t wanted = std::min(chunk_size + 4, size - offset);
+                SIZE_T bytes_read = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(base + offset),
+                        buffer.data(), wanted, &bytes_read) || bytes_read < 7) continue;
+                const auto begin = buffer.begin();
+                const auto end = begin + static_cast<ptrdiff_t>(bytes_read);
+                const char ascii_marker[] = "MAP: ";
+                const char wide_marker[] = {'M', 0, 'A', 0, 'P', 0, ':', 0, ' ', 0};
+                for (const auto& marker : {std::pair{ascii_marker, sizeof(ascii_marker) - 1}, std::pair{wide_marker, sizeof(wide_marker)}}) {
+                    const auto hit = std::search(begin, end, marker.first, marker.first + marker.second);
+                    if (hit == end) continue;
+                    const uintptr_t candidate = base + offset + static_cast<uintptr_t>(hit - begin);
+                    if (read_arena_map_label(candidate, name)) {
+                        g_arena_map_label = candidate;
+                        return true;
+                    }
+                }
+            }
+        }
+        const uintptr_t next = base + size;
+        if (next <= address) break;
+        address = next;
+    }
+    return false;
+}
+
+static void refresh_arena_map_name() {
+    if (!g_arena_reloaded) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_last_arena_map_read < std::chrono::seconds(1)) return;
+    g_last_arena_map_read = now;
+
+    wchar_t local_app_data[MAX_PATH]{};
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH)) return;
+    wchar_t path[MAX_PATH]{};
+    _snwprintf_s(path, _TRUNCATE, L"%s\\PortalWars2\\Saved\\Logs\\PortalWars2.log", local_app_data);
+    FILE* file = nullptr;
+    std::string name;
+    if (_wfopen_s(&file, path, L"rb") == 0 && file) {
+        _fseeki64(file, 0, SEEK_END);
+        const __int64 length = _ftelli64(file);
+        const __int64 tail_size = std::min<__int64>(length, 256 * 1024);
+        if (tail_size > 0 && _fseeki64(file, length - tail_size, SEEK_SET) == 0) {
+            std::string tail(static_cast<size_t>(tail_size), '\0');
+            const size_t bytes_read = fread(tail.data(), 1, tail.size(), file);
+            tail.resize(bytes_read);
+            const size_t marker = tail.rfind("/MAP_");
+            if (marker != std::string::npos) {
+                const size_t name_start = marker + 5;
+                size_t name_end = tail.find_first_of("/\\\r\n?'\" ", name_start);
+                if (name_end == std::string::npos) name_end = tail.size();
+                if (name_end > name_start && name_end - name_start <= 80)
+                    name = tail.substr(name_start, name_end - name_start);
+            }
+        }
+        fclose(file);
+    }
+    // The game can hold its log exclusively while running. In that case the
+    // active pause/lobby label is still resident as plain text, so cache that
+    // label and only perform a full search when it moves or changes.
+    if (name.empty()) scan_arena_map_label(name);
+    if (name.empty()) return;
+    std::replace(name.begin(), name.end(), '_', ' ');
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    std::scoped_lock lock(g_arena_map_mutex);
+    g_arena_pending_map = std::move(name);
+}
+
+static void apply_arena_map_name() {
+    std::scoped_lock lock(g_arena_map_mutex);
+    if (!g_arena_pending_map.empty()) g_map_name = g_arena_pending_map;
+}
+
 static int read_confirmed_hud_total() {
     wchar_t local_app_data[MAX_PATH]{};
     if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH)) return 0;
@@ -652,10 +983,11 @@ static int read_confirmed_hud_total() {
 }
 
 constexpr uintptr_t ROOT_OFFSET = 0x57576F0;
+constexpr uintptr_t BALL_ARRAY_OFFSET = 0x870;
+constexpr uintptr_t BALL_ARRAY_COUNT_OFFSET = BALL_ARRAY_OFFSET + sizeof(uintptr_t);
+constexpr uintptr_t BALL_ARRAY_CAPACITY_OFFSET = BALL_ARRAY_COUNT_OFFSET + sizeof(int);
 constexpr uintptr_t COUNT_OFFSET = 0x880;
 constexpr uintptr_t CLOCK_OFFSET = 0x898;
-constexpr uintptr_t BALL_ARRAY_OWNER_OFFSET = 0x1470;
-constexpr uintptr_t BALL_ARRAY_COUNT_OFFSET = 0x898;
 
 // Arena Reloaded 3.1-643074. The race owner points to the native race state;
 // unlike the HUD capture fallback, these fields update in the simulation tick.
@@ -676,18 +1008,11 @@ static bool readable_address(uintptr_t address, size_t size) {
 
 static bool race_sample(uintptr_t race, int& count, double& clock) {
     if (g_arena_reloaded) {
-        if (race && readable_address(race + ARENA_CLOCK_OFFSET, ARENA_TOTAL_OFFSET - ARENA_CLOCK_OFFSET + sizeof(int))) {
-            float native_clock = 0.0f;
-            int total = 0;
-            std::memcpy(&native_clock, reinterpret_cast<void*>(race + ARENA_CLOCK_OFFSET), sizeof(native_clock));
-            std::memcpy(&count, reinterpret_cast<void*>(race + ARENA_COUNT_OFFSET), sizeof(count));
-            std::memcpy(&total, reinterpret_cast<void*>(race + ARENA_TOTAL_OFFSET), sizeof(total));
-            clock = native_clock;
-            if (std::isfinite(clock) && clock >= 0.0 && clock < 3600.5 &&
-                total >= 1 && total <= 128 && count >= 0 && count <= total) return true;
-        }
-        // Keep the DirectX HUD reader as a compatibility fallback for future
-        // game builds whose native object signature has changed.
+        // Arena Reloaded exposes the authoritative race values in its rendered
+        // HUD. Reading that small backbuffer region was validated against the
+        // on-screen hundredths (for example 14:20.88) and the 2/31 counter.
+        // Do not prefer guessed native offsets: a plausible unrelated object
+        // can otherwise silently replace correct HUD data.
         if (!g_arena_hud_valid.load(std::memory_order_acquire)) return false;
         count = g_arena_count.load(std::memory_order_acquire);
         clock = g_arena_clock.load(std::memory_order_acquire);
@@ -701,21 +1026,19 @@ static bool race_sample(uintptr_t race, int& count, double& clock) {
 
 static int race_total_balls(uintptr_t race) {
     if (g_arena_reloaded) {
-        if (race && readable_address(race + ARENA_TOTAL_OFFSET, sizeof(int))) {
-            int total = 0;
-            std::memcpy(&total, reinterpret_cast<void*>(race + ARENA_TOTAL_OFFSET), sizeof(total));
-            if (total >= 1 && total <= 128) return total;
-        }
         return g_arena_total.load(std::memory_order_acquire);
     }
-    if (!readable_address(race + BALL_ARRAY_OWNER_OFFSET, sizeof(uintptr_t))) return 0;
-    uintptr_t owner = 0;
-    std::memcpy(&owner, reinterpret_cast<void*>(race + BALL_ARRAY_OWNER_OFFSET), sizeof(owner));
-    if (!owner || !readable_address(owner + BALL_ARRAY_COUNT_OFFSET, sizeof(int) * 2)) return 0;
+    // RaceBalls is a TArray at +0x870: Data, Num, Max. Num is the
+    // authoritative course total and sits immediately before the collected
+    // counter at +0x880. Atlantis Hard validates this as Num=29, Max=56.
+    if (!readable_address(race + BALL_ARRAY_OFFSET, sizeof(uintptr_t) + sizeof(int) * 2)) return 0;
+    uintptr_t data = 0;
     int total = 0, capacity = 0;
-    std::memcpy(&total, reinterpret_cast<void*>(owner + BALL_ARRAY_COUNT_OFFSET), sizeof(total));
-    std::memcpy(&capacity, reinterpret_cast<void*>(owner + BALL_ARRAY_COUNT_OFFSET + sizeof(int)), sizeof(capacity));
-    return total >= 3 && total <= 40 && capacity >= total && capacity <= 64 ? total : 0;
+    std::memcpy(&data, reinterpret_cast<void*>(race + BALL_ARRAY_OFFSET), sizeof(data));
+    std::memcpy(&total, reinterpret_cast<void*>(race + BALL_ARRAY_COUNT_OFFSET), sizeof(total));
+    std::memcpy(&capacity, reinterpret_cast<void*>(race + BALL_ARRAY_CAPACITY_OFFSET), sizeof(capacity));
+    return data && readable_address(data, sizeof(uintptr_t)) && total >= 3 && total <= 100 &&
+        capacity >= total && capacity <= 256 ? total : 0;
 }
 
 static uintptr_t locate_arena_race() {
@@ -888,6 +1211,196 @@ static bool initialize_imgui(IDXGISwapChain* swap_chain) {
     return true;
 }
 
+static void arena_srv_allocate(ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE* cpu, D3D12_GPU_DESCRIPTOR_HANDLE* gpu) {
+    if (!info || !info->SrvDescriptorHeap || g_arena_srv_allocated) {
+        cpu->ptr = 0;
+        gpu->ptr = 0;
+        return;
+    }
+    *cpu = info->SrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
+    *gpu = info->SrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart();
+    g_arena_srv_allocated = true;
+}
+
+static void arena_srv_free(ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE) {
+    g_arena_srv_allocated = false;
+}
+
+static bool load_arena_logo_texture(ID3D12CommandQueue* queue) {
+    wchar_t module_path[MAX_PATH]{};
+    if (!GetModuleFileNameW(g_module, module_path, MAX_PATH)) return false;
+    wchar_t* slash = wcsrchr(module_path, L'\\');
+    if (!slash) return false;
+    wcscpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - module_path), L"assets\\splitgate-new-s-mark-clean.png");
+
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    UINT width = 0, height = 0;
+    std::vector<unsigned char> pixels;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool decoded = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) &&
+        SUCCEEDED(factory->CreateDecoderFromFilename(module_path, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder)) &&
+        SUCCEEDED(decoder->GetFrame(0, &frame)) &&
+        SUCCEEDED(factory->CreateFormatConverter(&converter)) &&
+        SUCCEEDED(converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)) &&
+        SUCCEEDED(converter->GetSize(&width, &height));
+    if (decoded && width && height) {
+        pixels.resize(static_cast<size_t>(width) * height * 4);
+        if (FAILED(converter->CopyPixels(nullptr, width * 4, static_cast<UINT>(pixels.size()), pixels.data()))) pixels.clear();
+    }
+    if (converter) converter->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (factory) factory->Release();
+    if (pixels.empty()) return false;
+
+    D3D12_RESOURCE_DESC texture{};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Width = width;
+    texture.Height = height;
+    texture.DepthOrArraySize = 1;
+    texture.MipLevels = 1;
+    texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture.SampleDesc.Count = 1;
+    texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    D3D12_HEAP_PROPERTIES default_heap{};
+    default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(g_arena_d3d12_device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &texture,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_arena_logo_resource)))) return false;
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT rows = 0;
+    UINT64 row_size = 0, upload_size = 0;
+    g_arena_d3d12_device->GetCopyableFootprints(&texture, 0, 1, 0, &footprint, &rows, &row_size, &upload_size);
+    D3D12_RESOURCE_DESC upload_desc{};
+    upload_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    upload_desc.Width = upload_size;
+    upload_desc.Height = 1;
+    upload_desc.DepthOrArraySize = 1;
+    upload_desc.MipLevels = 1;
+    upload_desc.SampleDesc.Count = 1;
+    upload_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES upload_heap{};
+    upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    ID3D12Resource* upload = nullptr;
+    if (FAILED(g_arena_d3d12_device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload)))) return false;
+    unsigned char* mapped = nullptr;
+    if (FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) { upload->Release(); return false; }
+    for (UINT y = 0; y < height; ++y)
+        std::memcpy(mapped + footprint.Offset + static_cast<size_t>(y) * footprint.Footprint.RowPitch,
+            pixels.data() + static_cast<size_t>(y) * width * 4, static_cast<size_t>(width) * 4);
+    upload->Unmap(0, nullptr);
+
+    ArenaRenderFrame& upload_frame = g_arena_render_frames[0];
+    if (FAILED(upload_frame.allocator->Reset()) || FAILED(g_arena_render_list->Reset(upload_frame.allocator, nullptr))) {
+        upload->Release(); return false;
+    }
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = g_arena_logo_resource;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = upload;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = footprint;
+    g_arena_render_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = g_arena_logo_resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g_arena_render_list->ResourceBarrier(1, &barrier);
+    if (FAILED(g_arena_render_list->Close())) { upload->Release(); return false; }
+    ID3D12CommandList* lists[] = {g_arena_render_list};
+    queue->ExecuteCommandLists(1, lists);
+    const UINT64 value = ++g_arena_render_fence_value;
+    if (FAILED(queue->Signal(g_arena_render_fence, value))) { upload->Release(); return false; }
+    if (g_arena_render_fence->GetCompletedValue() < value) {
+        g_arena_render_fence->SetEventOnCompletion(value, g_arena_render_event);
+        if (WaitForSingleObject(g_arena_render_event, 1000) != WAIT_OBJECT_0) { upload->Release(); return false; }
+    }
+    upload->Release();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = texture.Format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_arena_srv_heap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += g_arena_srv_stride;
+    g_arena_logo_gpu = g_arena_srv_heap->GetGPUDescriptorHandleForHeapStart();
+    g_arena_logo_gpu.ptr += g_arena_srv_stride;
+    g_arena_d3d12_device->CreateShaderResourceView(g_arena_logo_resource, &srv, cpu);
+    return true;
+}
+
+static bool initialize_arena_imgui(IDXGISwapChain* swap_chain) {
+    ID3D12CommandQueue* queue = g_arena_command_queue.load(std::memory_order_acquire);
+    if (!queue || !g_arena_d3d12_device) return false;
+    if (FAILED(swap_chain->QueryInterface(IID_PPV_ARGS(&g_arena_swap_chain)))) return false;
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if (FAILED(swap_chain->GetDesc(&desc)) || desc.BufferCount == 0) return false;
+    g_game_window = desc.OutputWindow;
+
+    D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{};
+    rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rtv_desc.NumDescriptors = desc.BufferCount;
+    if (FAILED(g_arena_d3d12_device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&g_arena_rtv_heap)))) return false;
+    D3D12_DESCRIPTOR_HEAP_DESC srv_desc{};
+    srv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    srv_desc.NumDescriptors = 2;
+    srv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(g_arena_d3d12_device->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&g_arena_srv_heap)))) return false;
+    g_arena_rtv_stride = g_arena_d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    g_arena_srv_stride = g_arena_d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_arena_render_frames.resize(desc.BufferCount);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_arena_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < desc.BufferCount; ++i) {
+        ArenaRenderFrame& frame = g_arena_render_frames[i];
+        if (FAILED(g_arena_d3d12_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frame.allocator)))) return false;
+        if (FAILED(swap_chain->GetBuffer(i, IID_PPV_ARGS(&frame.target)))) return false;
+        g_arena_d3d12_device->CreateRenderTargetView(frame.target, nullptr, rtv);
+        rtv.ptr += g_arena_rtv_stride;
+    }
+    if (FAILED(g_arena_d3d12_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            g_arena_render_frames[0].allocator, nullptr, IID_PPV_ARGS(&g_arena_render_list)))) return false;
+    if (FAILED(g_arena_render_list->Close())) return false;
+    if (FAILED(g_arena_d3d12_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_arena_render_fence)))) return false;
+    g_arena_render_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_arena_render_event) return false;
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    g_font_body = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\bahnschrift.ttf", 19.0f);
+    g_font_header = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisbi.ttf", 22.0f);
+    g_font_clock = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\bahnschrift.ttf", 38.0f);
+    if (!g_font_body) g_font_body = io.Fonts->AddFontDefault();
+    if (!g_font_header) g_font_header = g_font_body;
+    if (!g_font_clock) g_font_clock = g_font_body;
+    ImGui::StyleColorsDark();
+    if (!ImGui_ImplWin32_Init(g_game_window)) return false;
+    ImGui_ImplDX12_InitInfo init{};
+    init.Device = g_arena_d3d12_device;
+    init.CommandQueue = queue;
+    init.NumFramesInFlight = static_cast<int>(desc.BufferCount);
+    init.RTVFormat = desc.BufferDesc.Format;
+    init.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    init.SrvDescriptorHeap = g_arena_srv_heap;
+    init.SrvDescriptorAllocFn = arena_srv_allocate;
+    init.SrvDescriptorFreeFn = arena_srv_free;
+    if (!ImGui_ImplDX12_Init(&init)) return false;
+    load_arena_logo_texture(queue);
+    g_original_wndproc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+        g_game_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(overlay_wndproc)));
+    return g_original_wndproc != nullptr;
+}
+
 struct HudGlyph {
     int left = 0;
     int top = 0;
@@ -980,13 +1493,75 @@ static std::vector<HudGlyph> find_hud_glyphs(
             glyph.bottom += top;
             const int glyph_width = glyph.right - glyph.left;
             const int glyph_height = glyph.bottom - glyph.top;
+            // The compact counter's digit 1 is only a few pixels wide. Keep
+            // its full-height stem while the height test still rejects the
+            // slash, punctuation, and sparkle noise around the HUD.
             if (glyph_height >= std::max(8, scan_height / 5) &&
-                glyph_width >= 4 && glyph_width <= std::max(12, width * 3 / 20) && glyph.area >= 30) {
+                glyph_width >= 2 && glyph_width <= std::max(12, width * 3 / 20) && glyph.area >= 12) {
                 result.push_back(glyph);
             }
         }
     }
     std::sort(result.begin(), result.end(), [](const HudGlyph& a, const HudGlyph& b) { return a.left < b.left; });
+    return result;
+}
+
+// Counter digits are not always one connected shape. In particular, the
+// anti-aliased horizontal bars of 5 can be separated by a one-pixel gap at
+// some resolutions, while 1 is a very narrow stem. Segmenting the counter by
+// occupied columns keeps both digits intact without relaxing the timer OCR.
+static std::vector<HudGlyph> find_hud_counter_glyphs(
+    const unsigned char* pixels, UINT row_pitch, int width, int height,
+    int left, int top, int right, int bottom, HudInk ink) {
+    left = std::clamp(left, 0, width);
+    right = std::clamp(right, left, width);
+    top = std::clamp(top, 0, height);
+    bottom = std::clamp(bottom, top, height);
+    const int scan_width = right - left;
+    const int scan_height = bottom - top;
+    if (scan_width <= 0 || scan_height <= 0) return {};
+
+    std::vector<int> column_ink(scan_width, 0);
+    for (int x = 0; x < scan_width; ++x) {
+        for (int y = 0; y < scan_height; ++y) {
+            const auto* row = pixels + (top + y) * row_pitch;
+            if (hud_ink(row + (left + x) * 4, ink)) ++column_ink[x];
+        }
+    }
+
+    std::vector<HudGlyph> result;
+    for (int x = 0; x < scan_width;) {
+        while (x < scan_width && column_ink[x] == 0) ++x;
+        if (x >= scan_width) break;
+        const int start = x;
+        int last_occupied = x;
+        int blank_run = 0;
+        for (; x < scan_width; ++x) {
+            if (column_ink[x] > 0) {
+                last_occupied = x;
+                blank_run = 0;
+            } else if (++blank_run >= 2) {
+                break;
+            }
+        }
+        const int end = last_occupied + 1;
+        HudGlyph glyph{left + start, bottom, left + end, top, 0};
+        for (int gx = start; gx < end; ++gx) {
+            for (int y = 0; y < scan_height; ++y) {
+                const auto* row = pixels + (top + y) * row_pitch;
+                if (!hud_ink(row + (left + gx) * 4, ink)) continue;
+                ++glyph.area;
+                glyph.top = std::min(glyph.top, top + y);
+                glyph.bottom = std::max(glyph.bottom, top + y + 1);
+            }
+        }
+        const int glyph_width = glyph.right - glyph.left;
+        const int glyph_height = glyph.bottom - glyph.top;
+        if (glyph_height >= std::max(8, scan_height / 5) && glyph_width >= 2 &&
+            glyph_width <= std::max(18, width * 3 / 20) && glyph.area >= 12) {
+            result.push_back(glyph);
+        }
+    }
     return result;
 }
 
@@ -1019,6 +1594,14 @@ static int read_hud_digit(const unsigned char* pixels, UINT row_pitch, const Hud
     // closed upper bowl. The supplied screenshots covered every other digit;
     // density cleanly separates these two at any resolution after normalization.
     if (best_digit == 7 && ink_pixels >= 115) best_digit = 9;
+    // In this font 0 and 8 have nearly identical outer bowls. Eight has a
+    // strong horizontal waist; zero remains hollow through its middle rows.
+    if (best_digit == 8) {
+        int middle_density = 0;
+        for (int y = 6; y <= 9; ++y)
+            middle_density = std::max(middle_density, std::popcount(static_cast<unsigned>(rows[y])));
+        if (middle_density <= 9) best_digit = 0;
+    }
     return best_score <= 112 ? best_digit : -1;
 }
 
@@ -1043,11 +1626,20 @@ static bool parse_arena_hud_pixels(const unsigned char* pixels, UINT row_pitch, 
             timer_valid = false;
         }
     }
-    const int counter_top = height * 52 / 100;
-    auto yellow = find_hud_glyphs(pixels, row_pitch, width, height,
-        width / 5, counter_top, width / 2, height, HudInk::yellow);
-    auto white = find_hud_glyphs(pixels, row_pitch, width, height,
-        width * 54 / 100, counter_top, width * 9 / 10, height, HudInk::white);
+    // Restrict the counter scan to the text baseline. The larger region also
+    // contains the checkmark, slash, and bright HUD border, which can bridge
+    // otherwise separate digit columns into one false glyph.
+    const int counter_top = height * 62 / 100;
+    const int counter_bottom = height * 90 / 100;
+    auto yellow = find_hud_counter_glyphs(pixels, row_pitch, width, height,
+        width / 5, counter_top, width / 2, counter_bottom, HudInk::yellow);
+    auto white = find_hud_counter_glyphs(pixels, row_pitch, width, height,
+        width * 57 / 100, counter_top, width * 9 / 10, counter_bottom, HudInk::white);
+    // The checkmark and slash sit immediately to the left of the values and
+    // can satisfy the same color/height tests. Counter digits are always the
+    // rightmost one or two glyphs in each half of the HUD.
+    if (yellow.size() > 2) yellow.erase(yellow.begin(), yellow.end() - 2);
+    if (white.size() > 2) white.erase(white.begin(), white.end() - 2);
     int current = 0;
     bool current_valid = !yellow.empty() && yellow.size() <= 2;
     for (const HudGlyph& glyph : yellow) {
@@ -1062,12 +1654,19 @@ static bool parse_arena_hud_pixels(const unsigned char* pixels, UINT row_pitch, 
         if (digit < 0) { total_valid = false; break; }
         total = total * 10 + digit;
     }
-    if (current_valid && total_valid && current >= 0 && current <= total && total >= 3 && total <= 100) {
+    const bool counter_valid = current_valid && total_valid && current >= 0 && current <= total &&
+        total >= 3 && total <= 100;
+    if (counter_valid) {
         g_arena_count.store(current, std::memory_order_release);
         g_arena_total.store(total, std::memory_order_release);
     }
-    g_arena_hud_valid.store(timer_valid, std::memory_order_release);
-    return timer_valid;
+    // Keep the live clock and expanded race panel running when a single
+    // counter frame is unreadable. The last confirmed count remains in the
+    // atomics until the next valid counter sample; collapsing the whole panel
+    // mid-race is much more disruptive than holding that count briefly.
+    const bool sample_valid = timer_valid;
+    g_arena_hud_valid.store(sample_valid, std::memory_order_release);
+    return sample_valid;
 }
 
 static bool read_arena_hud(IDXGISwapChain* swap_chain) {
@@ -1124,7 +1723,9 @@ static void __stdcall hooked_execute_command_lists(
     ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
     g_active_hook_calls.fetch_add(1, std::memory_order_acq_rel);
     ID3D12CommandQueue* expected = nullptr;
-    if (g_arena_reloaded && g_arena_command_queue.compare_exchange_strong(expected, queue, std::memory_order_acq_rel)) {
+    const D3D12_COMMAND_QUEUE_DESC queue_desc = queue->GetDesc();
+    if (g_arena_reloaded && queue_desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT &&
+        g_arena_command_queue.compare_exchange_strong(expected, queue, std::memory_order_acq_rel)) {
         queue->AddRef();
     }
     g_original_execute_command_lists(queue, count, lists);
@@ -1144,6 +1745,36 @@ static void release_arena_d3d12_capture() {
     g_arena_readback_format = DXGI_FORMAT_UNKNOWN;
 }
 
+static void release_arena_d3d12_renderer() {
+    if (g_arena_render_fence && g_arena_command_queue.load(std::memory_order_acquire)) {
+        ID3D12CommandQueue* queue = g_arena_command_queue.load(std::memory_order_acquire);
+        const UINT64 value = ++g_arena_render_fence_value;
+        if (SUCCEEDED(queue->Signal(g_arena_render_fence, value)) && g_arena_render_fence->GetCompletedValue() < value) {
+            g_arena_render_fence->SetEventOnCompletion(value, g_arena_render_event);
+            WaitForSingleObject(g_arena_render_event, 1000);
+        }
+    }
+    if (g_imgui_ready.exchange(false, std::memory_order_acq_rel)) {
+        ImGui_ImplDX12_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+    }
+    if (g_arena_render_list) { g_arena_render_list->Release(); g_arena_render_list = nullptr; }
+    for (ArenaRenderFrame& frame : g_arena_render_frames) {
+        if (frame.target) frame.target->Release();
+        if (frame.allocator) frame.allocator->Release();
+    }
+    g_arena_render_frames.clear();
+    if (g_arena_render_fence) { g_arena_render_fence->Release(); g_arena_render_fence = nullptr; }
+    if (g_arena_render_event) { CloseHandle(g_arena_render_event); g_arena_render_event = nullptr; }
+    if (g_arena_logo_resource) { g_arena_logo_resource->Release(); g_arena_logo_resource = nullptr; }
+    g_arena_logo_gpu.ptr = 0;
+    if (g_arena_srv_heap) { g_arena_srv_heap->Release(); g_arena_srv_heap = nullptr; }
+    if (g_arena_rtv_heap) { g_arena_rtv_heap->Release(); g_arena_rtv_heap = nullptr; }
+    if (g_arena_swap_chain) { g_arena_swap_chain->Release(); g_arena_swap_chain = nullptr; }
+    g_arena_srv_allocated = false;
+}
+
 static bool read_arena_hud_d3d12(IDXGISwapChain* swap_chain) {
     const auto now = std::chrono::steady_clock::now();
     if (now - g_last_arena_hud_probe < std::chrono::milliseconds(15)) {
@@ -1152,16 +1783,9 @@ static bool read_arena_hud_d3d12(IDXGISwapChain* swap_chain) {
     g_last_arena_hud_probe = now;
     if (!g_arena_d3d12_device) {
         if (FAILED(swap_chain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&g_arena_d3d12_device)))) return false;
-        if (!g_arena_command_queue.load(std::memory_order_acquire)) {
-            D3D12_COMMAND_QUEUE_DESC queue_desc{};
-            queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-            ID3D12CommandQueue* capture_queue = nullptr;
-            if (FAILED(g_arena_d3d12_device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&capture_queue)))) return false;
-            ID3D12CommandQueue* expected = nullptr;
-            if (!g_arena_command_queue.compare_exchange_strong(expected, capture_queue, std::memory_order_acq_rel)) {
-                capture_queue->Release();
-            }
-        }
+        // Wait for ExecuteCommandLists to reveal the game's actual direct
+        // queue. A private queue would not be synchronized with Present.
+        if (!g_arena_command_queue.load(std::memory_order_acquire)) return false;
         if (FAILED(g_arena_d3d12_device->CreateCommandAllocator(
                 D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_arena_copy_allocator)))) return false;
         if (FAILED(g_arena_d3d12_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -1412,7 +2036,7 @@ static bool strict_finish_banner_visible(IDXGISwapChain* swap_chain) {
 
 static bool race_lobby_visible(IDXGISwapChain* swap_chain) {
     const auto now = std::chrono::steady_clock::now();
-    if (now - g_last_lobby_probe < std::chrono::milliseconds(200)) {
+    if (now - g_last_lobby_probe < std::chrono::milliseconds(100)) {
         return g_in_race_lobby.load(std::memory_order_acquire);
     }
     g_last_lobby_probe = now;
@@ -1431,40 +2055,51 @@ static bool race_lobby_visible(IDXGISwapChain* swap_chain) {
             back_buffer->Release(); return false;
         }
     }
-    int dark_bar_patches = 0;
+    int dark_footer_rows = 0;
     const float xs[] = {0.08f, 0.20f, 0.32f, 0.44f, 0.56f, 0.68f, 0.80f, 0.92f};
-    for (float fraction : xs) {
-        const UINT left = static_cast<UINT>(source.Width * fraction) - size / 2;
-        const UINT top = static_cast<UINT>(source.Height * 0.965f) - size / 2;
-        D3D11_BOX box{left, top, 0, left + size, top + size, 1};
-        g_context->CopySubresourceRegion(g_lobby_probe, 0, 0, 0, 0, back_buffer, 0, &box);
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (FAILED(g_context->Map(g_lobby_probe, 0, D3D11_MAP_READ, 0, &mapped))) continue;
-        int dark = 0;
-        int samples = 0;
-        for (UINT y = 0; y < size; y += 2) {
-            const unsigned char* row = static_cast<const unsigned char*>(mapped.pData) + y * mapped.RowPitch;
-            for (UINT x = 0; x < size; x += 2) {
-                const unsigned char* p = row + x * 4;
-                const int high = std::max({static_cast<int>(p[0]), static_cast<int>(p[1]), static_cast<int>(p[2])});
-                const int low = std::min({static_cast<int>(p[0]), static_cast<int>(p[1]), static_cast<int>(p[2])});
-                // The race lobby footer is a dark navy/gray gradient rather
-                // than a single flat color; allow its brighter center while
-                // still rejecting colorful gameplay pixels.
-                if (high < 96 && high - low < 36) ++dark;
-                ++samples;
+    const float ys[] = {0.955f, 0.985f};
+    for (float y_fraction : ys) {
+        int dark_bar_patches = 0;
+        for (float x_fraction : xs) {
+            const UINT left = static_cast<UINT>(source.Width * x_fraction) - size / 2;
+            const UINT top = static_cast<UINT>(source.Height * y_fraction) - size / 2;
+            D3D11_BOX box{left, top, 0, left + size, top + size, 1};
+            g_context->CopySubresourceRegion(g_lobby_probe, 0, 0, 0, 0, back_buffer, 0, &box);
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (FAILED(g_context->Map(g_lobby_probe, 0, D3D11_MAP_READ, 0, &mapped))) continue;
+            int dark = 0;
+            int samples = 0;
+            for (UINT y = 0; y < size; y += 2) {
+                const unsigned char* row = static_cast<const unsigned char*>(mapped.pData) + y * mapped.RowPitch;
+                for (UINT x = 0; x < size; x += 2) {
+                    const unsigned char* p = row + x * 4;
+                    const int high = std::max({static_cast<int>(p[0]), static_cast<int>(p[1]), static_cast<int>(p[2])});
+                    const int low = std::min({static_cast<int>(p[0]), static_cast<int>(p[1]), static_cast<int>(p[2])});
+                    // The race-selection footer is a broad dark blue/purple
+                    // band. It is colored and brighter in the center, so use
+                    // two continuous rows instead of requiring near-gray.
+                    if (high < 138 && low < 105 && high - low < 82) ++dark;
+                    ++samples;
+                }
             }
+            g_context->Unmap(g_lobby_probe, 0);
+            if (samples > 0 && static_cast<float>(dark) / samples > 0.58f) ++dark_bar_patches;
         }
-        g_context->Unmap(g_lobby_probe, 0);
-        if (samples > 0 && static_cast<float>(dark) / samples > 0.72f) ++dark_bar_patches;
+        if (dark_bar_patches >= 6) ++dark_footer_rows;
     }
     back_buffer->Release();
-    const bool visible = dark_bar_patches >= 6;
+    const bool visible = dark_footer_rows == 2;
     g_in_race_lobby.store(visible, std::memory_order_release);
     return visible;
 }
 
 static void draw_splitgate_mark(ImDrawList* draw, const ImVec2& position, float width) {
+    if (g_arena_reloaded && g_arena_logo_gpu.ptr) {
+        const float height = width / 1.927f;
+        draw->AddImage(ImTextureRef(static_cast<ImTextureID>(g_arena_logo_gpu.ptr)), position,
+            ImVec2(position.x + width, position.y + height));
+        return;
+    }
     if (g_logo_texture) {
         const float height = width / 1.927f;
         const ImTextureID texture_id = static_cast<ImTextureID>(reinterpret_cast<uintptr_t>(g_logo_texture));
@@ -1502,6 +2137,11 @@ static void format_delta(double value, char* output, size_t output_size) {
     std::snprintf(output, output_size, "%+.3f", value);
 }
 
+static ImU32 theme_color(const float color[4], float alpha_multiplier = 1.0f) {
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(color[0], color[1], color[2],
+        std::clamp(color[3] * alpha_multiplier, 0.0f, 1.0f)));
+}
+
 static std::string virtual_key_name(UINT virtual_key) {
     UINT scan = MapVirtualKeyW(virtual_key, MAPVK_VK_TO_VSC);
     if (virtual_key == VK_LEFT || virtual_key == VK_UP || virtual_key == VK_RIGHT || virtual_key == VK_DOWN ||
@@ -1524,6 +2164,9 @@ static void reset_run_for_lobby() {
     g_prestart_saw_zero_count = false;
     g_restart_transition_pending.store(false, std::memory_order_release);
     g_finish_time = 0.0;
+    g_total_balls = 0;
+    g_total_candidate = 0;
+    g_total_candidate_hits = 0;
     g_previous_clock = -1.0;
     g_last_count = -1;
     g_splits.fill(0.0);
@@ -1553,27 +2196,87 @@ static void draw_splitter_settings() {
     const bool open = g_settings_open.load(std::memory_order_acquire);
     ImGui::GetIO().MouseDrawCursor = open;
     if (!open) return;
-    ImGui::SetNextWindowPos(ImVec2(54.0f, 80.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(430.0f, 230.0f), ImGuiCond_Always);
+    const ImGuiIO& display = ImGui::GetIO();
+    float& active_panel_x = g_arena_reloaded ? g_arena_panel_x : g_sg1_panel_x;
+    float& active_panel_y = g_arena_reloaded ? g_arena_panel_y : g_sg1_panel_y;
+    float& active_hud_scale = g_arena_reloaded ? g_arena_hud_scale : g_sg1_hud_scale;
+    float& active_text_scale = g_arena_reloaded ? g_arena_text_scale : g_sg1_text_scale;
+    if (!g_arena_reloaded && active_panel_x < 0.0f)
+        active_panel_x = std::max(18.0f, display.DisplaySize.x - 400.0f - 36.0f);
+    const float settings_x = active_panel_x < display.DisplaySize.x * 0.5f
+        ? std::max(18.0f, display.DisplaySize.x - 460.0f - 54.0f)
+        : 54.0f;
+    ImGui::SetNextWindowPos(ImVec2(settings_x, 80.0f), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(480.0f, g_arena_reloaded ? 570.0f : 650.0f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.96f);
     bool keep_open = true;
-    ImGui::Begin("SPLITTER SETTINGS  //  ` TO CLOSE", &keep_open,
+    const std::string menu_key = virtual_key_name(g_restart_virtual_key.load(std::memory_order_acquire));
+    const std::string settings_title = "SPLITTER SETTINGS  //  DOUBLE-TAP " + menu_key + " TO CLOSE";
+    ImGui::Begin(settings_title.c_str(), &keep_open,
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
-    ImGui::TextColored(ImVec4(0.44f, 0.90f, 1.0f, 1.0f), "RACE CONTROLS");
+    ImGui::TextColored(ImVec4(0.44f, 0.90f, 1.0f, 1.0f), "HUD LAYOUT");
     ImGui::Separator();
-    const std::string restart_name = virtual_key_name(g_restart_virtual_key.load(std::memory_order_acquire));
-    ImGui::Text("Hold to restart:  %s", restart_name.c_str());
-    ImGui::SameLine(270.0f);
-    if (g_rebind_listening.load(std::memory_order_acquire)) {
-        ImGui::TextColored(ImVec4(1.0f, 0.84f, 0.17f, 1.0f), "PRESS A KEY...");
-    } else if (ImGui::Button("CHANGE BIND", ImVec2(125.0f, 30.0f))) {
-        g_rebind_listening.store(true, std::memory_order_release);
+    if (ImGui::SliderFloat("HUD SCALE", &active_hud_scale, 0.60f, 1.80f, "%.2fx"))
+        save_overlay_settings();
+    if (ImGui::SliderFloat("TEXT SIZE", &active_text_scale, 0.75f, 1.50f, "%.2fx"))
+        save_overlay_settings();
+    ImGui::TextDisabled("Drag the lower-right corner of the HUD to resize it.");
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(g_theme_cyan[0], g_theme_cyan[1], g_theme_cyan[2], 1.0f), "THEME COLORS");
+    ImGui::Separator();
+    bool colors_changed = false;
+    colors_changed |= ImGui::ColorEdit4("BACKGROUND", g_theme_background, ImGuiColorEditFlags_AlphaBar);
+    colors_changed |= ImGui::ColorEdit4("BORDER", g_theme_border, ImGuiColorEditFlags_AlphaBar);
+    colors_changed |= ImGui::ColorEdit4("CYAN ACCENT", g_theme_cyan, ImGuiColorEditFlags_AlphaBar);
+    colors_changed |= ImGui::ColorEdit4("YELLOW ACCENT", g_theme_yellow, ImGuiColorEditFlags_AlphaBar);
+    if (colors_changed) save_overlay_settings();
+    float position[2] = {active_panel_x, active_panel_y};
+    const ImGuiIO& io = ImGui::GetIO();
+    if (ImGui::DragFloat2("HUD POSITION", position, 1.0f, 0.0f,
+            std::max(io.DisplaySize.x, io.DisplaySize.y), "%.0f")) {
+        active_panel_x = std::clamp(position[0], 18.0f, std::max(18.0f, io.DisplaySize.x - 400.0f));
+        active_panel_y = std::clamp(position[1], 16.0f, std::max(16.0f, io.DisplaySize.y - 100.0f));
+    }
+    if (ImGui::Button("SAVE POSITION", ImVec2(150.0f, 30.0f))) save_overlay_settings();
+    ImGui::SameLine();
+    if (ImGui::Button("RESET POSITION", ImVec2(150.0f, 30.0f))) {
+        active_panel_x = g_arena_reloaded ? 36.0f : std::max(18.0f, io.DisplaySize.x - 400.0f - 36.0f);
+        active_panel_y = 250.0f;
+        save_overlay_settings();
+    }
+    if (g_arena_reloaded) {
+        if (ImGui::Checkbox("Hide overlay outside a race", &g_arena_hide_outside_race)) save_overlay_settings();
+    }
+    ImGui::TextDisabled("Drag the HUD itself anywhere while this menu is open.");
+    ImGui::TextDisabled("Dragged positions save automatically.");
+    if (!g_arena_reloaded) {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.44f, 0.90f, 1.0f, 1.0f), "RACE CONTROLS");
+        ImGui::Separator();
+        const std::string restart_name = virtual_key_name(g_restart_virtual_key.load(std::memory_order_acquire));
+        ImGui::Text("Hold to restart:  %s", restart_name.c_str());
+        ImGui::SameLine(290.0f);
+        if (g_rebind_listening.load(std::memory_order_acquire)) {
+            ImGui::TextColored(ImVec4(1.0f, 0.84f, 0.17f, 1.0f), "PRESS A KEY...");
+        } else if (ImGui::Button("CHANGE BIND", ImVec2(125.0f, 30.0f))) {
+            g_rebind_listening.store(true, std::memory_order_release);
+        }
+        ImGui::TextDisabled("Hold time: %.2f seconds", RESTART_HOLD_SECONDS);
+        ImGui::TextDisabled("Release before the bar fills to cancel.");
     }
     ImGui::Spacing();
-    ImGui::TextDisabled("Hold time: %.2f seconds", RESTART_HOLD_SECONDS);
-    ImGui::TextDisabled("Release before the bar fills to cancel.");
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(1.0f, 0.84f, 0.17f, 1.0f), "OVERLAY");
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.10f, 0.14f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.14f, 0.18f, 1.0f));
+    if (ImGui::Button("UNLOAD OVERLAY", ImVec2(180.0f, 34.0f))) {
+        g_settings_open.store(false, std::memory_order_release);
+        g_unload_requested.store(true, std::memory_order_release);
+    }
+    ImGui::PopStyleColor(2);
     ImGui::Spacing();
-    ImGui::TextColored(ImVec4(0.65f, 0.70f, 0.78f, 1.0f), "Press ` at any time to close these settings.");
+    ImGui::TextColored(ImVec4(0.65f, 0.70f, 0.78f, 1.0f),
+        "Double-tap %s to open or close settings. (` also works.)", menu_key.c_str());
     ImGui::End();
     if (!keep_open) g_settings_open.store(false, std::memory_order_release);
 }
@@ -1581,12 +2284,13 @@ static void draw_splitter_settings() {
 static void draw_proof_of_concept() {
     refresh_race_profile();
     load_personal_bests();
-    if (const int known_total = known_total_for_profile(); known_total > 0) g_total_balls = known_total;
     const uintptr_t race = g_race_object.load();
     int count = 0;
     double clock = 0.0;
     const bool have_race = race && race_sample(race, count, clock);
     double frame_aligned_clock = clock;
+
+    if (g_arena_reloaded && g_arena_hide_outside_race && !have_race) return;
 
     if (have_race) {
         const auto state_now = std::chrono::steady_clock::now();
@@ -1617,6 +2321,13 @@ static void draw_proof_of_concept() {
         // back to zero (or until a ball count proves the run is underway).
         if (race != g_render_race_object) {
             g_render_race_object = race;
+            if (!g_arena_reloaded) {
+                // This also supports injection after the race has already
+                // started, when the lobby selection callbacks were missed.
+                refresh_profile_from_game_log();
+                refresh_profile_from_live_objects(reinterpret_cast<void*>(race));
+                if (const int live_total = race_total_balls(race); live_total > 0) g_total_balls = live_total;
+            }
             g_splits.fill(0.0);
             for (auto& split : g_sampled_splits) split.store(0.0, std::memory_order_release);
             g_last_count = count;
@@ -1640,7 +2351,7 @@ static void draw_proof_of_concept() {
         // The preceding Present sample is the value used by the HUD currently
         // in the backbuffer. Keep the sampler timestamps untouched: those mark
         // the actual count transitions and remain the authoritative splits.
-        if (g_previous_clock >= 0.0 && clock >= g_previous_clock &&
+        if (!g_arena_reloaded && g_previous_clock >= 0.0 && clock >= g_previous_clock &&
             clock - g_previous_clock < 0.10) {
             frame_aligned_clock = g_previous_clock;
         }
@@ -1654,13 +2365,17 @@ static void draw_proof_of_concept() {
         if (g_last_count < 0) {
             g_last_count = count;
             g_race_running = count > 0;
-            if (count > 0 && known_total_for_profile() > 0 && g_run_profile_key.empty()) begin_run_comparison();
+            if (count > 0 && g_total_balls > 0 &&
+                g_run_profile_key.empty()) begin_run_comparison();
         }
         if (count < g_last_count) {
             g_splits.fill(0.0);
             for (auto& split : g_sampled_splits) split.store(0.0, std::memory_order_release);
             g_last_count = count;
-            g_race_running = false;
+            // Arena's timer is live before the first ball, so a restart to
+            // zero begins a new visible run immediately. Splitgate 1 retains
+            // its pre-start gate behavior.
+            g_race_running = g_arena_reloaded;
             g_waiting_for_start_reset = false;
             if (count == 0) g_prestart_saw_zero_count = true;
             g_finished = false;
@@ -1692,7 +2407,8 @@ static void draw_proof_of_concept() {
             g_prestart_gate = false;
             g_race_running = true;
         }
-        if (g_race_running && known_total_for_profile() > 0 && g_run_profile_key.empty()) begin_run_comparison();
+        if (g_race_running && g_total_balls > 0 &&
+            g_run_profile_key.empty()) begin_run_comparison();
         if (g_race_running && count > g_last_count) {
             // Count and clock come from the same game-owned race object.
             // Stamp the transition with that sample; the previous frame is
@@ -1703,29 +2419,60 @@ static void draw_proof_of_concept() {
             g_last_ball_time = std::chrono::steady_clock::now();
         }
         g_previous_clock = clock;
+
+        // Arena can remove or replace its race HUD immediately after the last
+        // pickup. Commit here, after this frame has recorded every split,
+        // rather than relying only on the earlier Present pre-pass.
+        if (g_arena_reloaded && !g_finished && g_total_balls > 0 && count >= g_total_balls) {
+            g_finished = true;
+            g_race_running = false;
+            g_finish_time = (count < static_cast<int>(g_splits.size()) && g_splits[count] > 0.0)
+                ? g_splits[count] : clock;
+            commit_personal_best(count);
+        }
+        if (g_arena_reloaded && g_finished) commit_personal_best(g_last_count);
     }
 
-    const bool expanded = have_race && (g_race_running || g_finished || count > 0);
-
+    const bool expanded = have_race && (g_arena_reloaded || g_race_running || g_finished || count > 0);
     // Match Splitgate 2's unobtrusive race restart affordance. The fill gives
     // clear feedback that a tap is harmless and releasing early cancels it.
-    if (have_race && (g_race_running || g_finished) && !g_in_race_lobby.load(std::memory_order_acquire)) {
+    if (!g_arena_reloaded && have_race && g_race_running && !g_in_race_lobby.load(std::memory_order_acquire)) {
         ImDrawList* restart_draw = ImGui::GetForegroundDrawList();
         const ImGuiIO& restart_io = ImGui::GetIO();
-        const ImVec2 prompt_min(44.0f, restart_io.DisplaySize.y - 108.0f);
-        const ImVec2 prompt_max(344.0f, restart_io.DisplaySize.y - 62.0f);
-        restart_draw->AddRectFilled(prompt_min, prompt_max, IM_COL32(15, 18, 45, 220), 9.0f);
-        restart_draw->AddRect(prompt_min, prompt_max, IM_COL32(100, 112, 174, 230), 9.0f, 0, 2.0f);
-        restart_draw->AddRectFilled(ImVec2(prompt_min.x + 6.0f, prompt_max.y - 6.0f),
-            ImVec2(prompt_min.x + 6.0f + (prompt_max.x - prompt_min.x - 12.0f) *
-                std::clamp(g_restart_hold_progress.load(std::memory_order_acquire), 0.0f, 1.0f), prompt_max.y - 3.0f),
-            IM_COL32(112, 229, 255, 255), 2.0f);
-        restart_draw->AddRect(ImVec2(prompt_min.x + 12.0f, prompt_min.y + 9.0f), ImVec2(prompt_min.x + 38.0f, prompt_min.y + 35.0f),
-            IM_COL32(230, 238, 255, 255), 5.0f, 0, 2.0f);
         const std::string restart_key = virtual_key_name(g_restart_virtual_key.load(std::memory_order_acquire));
         const char* restart_key_short = restart_key.empty() ? "?" : restart_key.c_str();
-        restart_draw->AddText(g_font_header, 15.0f, ImVec2(prompt_min.x + 17.0f, prompt_min.y + 13.0f), IM_COL32(255, 255, 255, 255), restart_key_short);
-        restart_draw->AddText(g_font_header, 17.0f, ImVec2(prompt_min.x + 50.0f, prompt_min.y + 13.0f), IM_COL32(236, 242, 255, 255), "[HOLD] RESTART RACE");
+        const float progress = std::clamp(g_restart_hold_progress.load(std::memory_order_acquire), 0.0f, 1.0f);
+        const auto draw_prompt_keycap = [&](float x, float y, const char* badge, float badge_width,
+                const char* action, ImU32 accent) {
+            const ImVec2 key_min(x, y);
+            const ImVec2 key_max(x + 48.0f, y + 46.0f);
+            restart_draw->AddRectFilled(ImVec2(key_min.x, key_min.y + 5.0f), ImVec2(key_max.x, key_max.y + 5.0f),
+                IM_COL32(93, 119, 132, 245), 7.0f);
+            restart_draw->AddRectFilled(key_min, key_max, IM_COL32(217, 229, 234, 255), 7.0f);
+            const ImVec2 key_size = g_font_header->CalcTextSizeA(25.0f, FLT_MAX, 0.0f, restart_key_short);
+            restart_draw->AddText(g_font_header, 25.0f,
+                ImVec2(key_min.x + (48.0f - key_size.x) * 0.5f, key_min.y + 10.0f),
+                IM_COL32(63, 91, 105, 255), restart_key_short);
+            const ImVec2 badge_min(x + 28.0f, y - 8.0f);
+            const ImVec2 badge_max(badge_min.x + badge_width, badge_min.y + 25.0f);
+            restart_draw->AddRectFilled(badge_min, badge_max, IM_COL32(2, 7, 13, 255), 7.0f);
+            const ImVec2 badge_size = g_font_header->CalcTextSizeA(15.0f, FLT_MAX, 0.0f, badge);
+            restart_draw->AddText(g_font_header, 15.0f,
+                ImVec2(badge_min.x + (badge_width - badge_size.x) * 0.5f, badge_min.y + 4.0f),
+                IM_COL32(255, 255, 255, 255), badge);
+            restart_draw->AddText(g_font_header, 18.0f, ImVec2(x + 66.0f, y + 13.0f), accent, action);
+        };
+        const ImVec2 prompt_min(44.0f, restart_io.DisplaySize.y - 128.0f);
+        const ImVec2 prompt_max(494.0f, restart_io.DisplaySize.y - 52.0f);
+        restart_draw->AddRectFilled(prompt_min, prompt_max, theme_color(g_theme_background), 9.0f);
+        restart_draw->AddRect(prompt_min, prompt_max, theme_color(g_theme_border), 9.0f, 0, 2.0f);
+        draw_prompt_keycap(prompt_min.x + 14.0f, prompt_min.y + 13.0f,
+            "HOLD", 55.0f, "RESTART", theme_color(g_theme_yellow));
+        draw_prompt_keycap(prompt_min.x + 236.0f, prompt_min.y + 13.0f,
+            "2X", 34.0f, "MENU", theme_color(g_theme_cyan));
+        restart_draw->AddRectFilled(ImVec2(prompt_min.x + 10.0f, prompt_max.y - 9.0f),
+            ImVec2(prompt_min.x + 10.0f + 400.0f * progress, prompt_max.y - 5.0f),
+            theme_color(g_theme_cyan), 2.0f);
     }
     int visible_rows = 0;
     if (expanded) {
@@ -1734,95 +2481,204 @@ static void draw_proof_of_concept() {
         }
     }
 
-    constexpr float panel_width = 400.0f;
-    constexpr float row_height = 22.0f;
-    const float target_height = expanded ? 159.0f + visible_rows * row_height : 94.0f;
+    float& active_hud_scale = g_arena_reloaded ? g_arena_hud_scale : g_sg1_hud_scale;
+    float& active_text_size = g_arena_reloaded ? g_arena_text_scale : g_sg1_text_scale;
+    const float hud_scale = active_hud_scale;
+    const float text_scale = hud_scale * active_text_size;
+    const float panel_width = 400.0f * hud_scale;
+    const float row_height = 22.0f * hud_scale * std::max(1.0f, active_text_size);
+    const float target_height = expanded ? 159.0f * hud_scale + visible_rows * row_height : 94.0f * hud_scale;
     static float animated_height = 0.0f;
     if (animated_height <= 0.0f) animated_height = target_height;
     animated_height += (target_height - animated_height) * std::min(1.0f, ImGui::GetIO().DeltaTime * 10.0f);
 
     ImGuiIO& io = ImGui::GetIO();
-    const ImVec2 origin(io.DisplaySize.x - panel_width - 36.0f, 190.0f);
-    const ImVec2 panel_min(origin.x - 18.0f, origin.y - 16.0f);
+    // Leave the game's Lifetime Best card unobstructed in the upper-right.
+    if (!g_arena_reloaded && g_sg1_panel_x < 0.0f)
+        g_sg1_panel_x = std::max(18.0f, io.DisplaySize.x - panel_width - 36.0f);
+    float& active_panel_x = g_arena_reloaded ? g_arena_panel_x : g_sg1_panel_x;
+    float& active_panel_y = g_arena_reloaded ? g_arena_panel_y : g_sg1_panel_y;
+    const float panel_x = std::clamp(active_panel_x, 18.0f, std::max(18.0f, io.DisplaySize.x - panel_width));
+    const float panel_y = std::clamp(active_panel_y, 16.0f, std::max(16.0f, io.DisplaySize.y - 94.0f * hud_scale));
+    const ImVec2 origin(panel_x, panel_y);
+    const ImVec2 panel_min(origin.x - 18.0f * hud_scale, origin.y - 16.0f * hud_scale);
     const ImVec2 panel_max(origin.x + panel_width, panel_min.y + animated_height);
-    const float notch_low_y = std::min(panel_min.y + 116.0f, panel_max.y - 2.0f);
-    const float notch_high_y = std::min(panel_min.y + 98.0f, panel_max.y - 18.0f);
+    if (g_settings_open.load(std::memory_order_acquire)) {
+        static bool was_dragging = false;
+        ImGui::SetNextWindowPos(panel_min, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(panel_max.x - panel_min.x, panel_max.y - panel_min.y), ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::Begin("##HUD_DRAG_SURFACE", nullptr,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus);
+        ImGui::SetCursorScreenPos(panel_min);
+        ImGui::InvisibleButton("##DRAG_HUD", ImVec2(panel_max.x - panel_min.x, panel_max.y - panel_min.y));
+        const bool dragging = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+        if (ImGui::IsItemHovered() || dragging) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+        if (dragging) {
+            active_panel_x = std::clamp(active_panel_x + io.MouseDelta.x,
+                18.0f, std::max(18.0f, io.DisplaySize.x - panel_width));
+            active_panel_y = std::clamp(active_panel_y + io.MouseDelta.y,
+                16.0f, std::max(16.0f, io.DisplaySize.y - animated_height + 16.0f));
+        }
+        if (was_dragging && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) save_overlay_settings();
+        was_dragging = dragging;
+        ImGui::End();
+        ImGui::PopStyleVar();
+        static bool was_resizing = false;
+        const float handle_size = 30.0f;
+        const ImVec2 handle_min(panel_max.x - handle_size, panel_max.y - handle_size);
+        ImDrawList* handle_draw = ImGui::GetForegroundDrawList();
+        handle_draw->AddLine(ImVec2(panel_max.x - 21.0f, panel_max.y - 7.0f),
+            ImVec2(panel_max.x - 7.0f, panel_max.y - 21.0f), theme_color(g_theme_cyan), 2.0f);
+        handle_draw->AddLine(ImVec2(panel_max.x - 14.0f, panel_max.y - 5.0f),
+            ImVec2(panel_max.x - 5.0f, panel_max.y - 14.0f), theme_color(g_theme_yellow), 2.0f);
+        ImGui::SetNextWindowPos(handle_min, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(handle_size, handle_size), ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::Begin("##HUD_RESIZE_HANDLE", nullptr,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus);
+        ImGui::InvisibleButton("##RESIZE_HUD", ImVec2(handle_size, handle_size));
+        const bool resizing = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+        if (ImGui::IsItemHovered() || resizing) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
+        if (resizing) {
+            active_hud_scale = std::clamp(active_hud_scale +
+                (io.MouseDelta.x + io.MouseDelta.y) * 0.0025f, 0.60f, 1.80f);
+        }
+        if (was_resizing && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) save_overlay_settings();
+        was_resizing = resizing;
+        ImGui::End();
+        ImGui::PopStyleVar();
+    }
     ImDrawList* draw = ImGui::GetForegroundDrawList();
-    const ImVec2 panel_shape[] = {
-        panel_min, ImVec2(panel_max.x - 24.0f, panel_min.y), ImVec2(panel_max.x, panel_min.y + 24.0f),
-        ImVec2(panel_max.x, panel_max.y - 24.0f), ImVec2(panel_max.x - 24.0f, panel_max.y),
-        ImVec2(panel_min.x, panel_max.y), ImVec2(panel_min.x, notch_low_y), ImVec2(panel_min.x + 8.0f, notch_high_y)
-    };
-    draw->AddConvexPolyFilled(panel_shape, 8, IM_COL32(3, 17, 29, 225));
-    draw->AddPolyline(panel_shape, 8, IM_COL32(10, 38, 58, 255), ImDrawFlags_Closed, 2.0f);
-
     char race_title[160]{};
     std::snprintf(race_title, sizeof(race_title), "%s  //  %s", g_map_name.c_str(), g_difficulty.c_str());
-    draw->AddText(g_font_header, 18.0f, origin, IM_COL32(112, 229, 255, 255), race_title);
-    draw->AddLine(ImVec2(origin.x, origin.y + 29.0f), ImVec2(origin.x + panel_width * 0.70f, origin.y + 29.0f), IM_COL32(244, 213, 44, 255), 3.0f);
+
+    const float notch_low_y = std::min(panel_min.y + 116.0f * hud_scale, panel_max.y - 2.0f * hud_scale);
+    const float notch_high_y = std::min(panel_min.y + 98.0f * hud_scale, panel_max.y - 18.0f * hud_scale);
+    const ImVec2 panel_shape[] = {
+        panel_min, ImVec2(panel_max.x - 24.0f * hud_scale, panel_min.y), ImVec2(panel_max.x, panel_min.y + 24.0f * hud_scale),
+        ImVec2(panel_max.x, panel_max.y - 24.0f * hud_scale), ImVec2(panel_max.x - 24.0f * hud_scale, panel_max.y),
+        ImVec2(panel_min.x, panel_max.y), ImVec2(panel_min.x, notch_low_y), ImVec2(panel_min.x + 8.0f * hud_scale, notch_high_y)
+    };
+    draw->AddConvexPolyFilled(panel_shape, 8, theme_color(g_theme_background));
+    draw->AddPolyline(panel_shape, 8, theme_color(g_theme_border), ImDrawFlags_Closed, std::max(1.0f, 2.0f * hud_scale));
+
+    draw->AddText(g_font_header, 18.0f * text_scale, origin, theme_color(g_theme_cyan), race_title);
+    draw->AddLine(ImVec2(origin.x, origin.y + 29.0f * hud_scale), ImVec2(origin.x + panel_width * 0.70f, origin.y + 29.0f * hud_scale),
+        theme_color(g_theme_yellow), std::max(1.5f, 3.0f * hud_scale));
     // Center the mark in the full right-hand header pocket rather than
     // pinning it against the clipped outer corner.
-    draw_splitgate_mark(draw, ImVec2(origin.x + 294.0f, origin.y - 1.0f), 84.0f);
+    draw_splitgate_mark(draw, ImVec2(origin.x + 294.0f * hud_scale, origin.y - 1.0f * hud_scale), 84.0f * hud_scale);
 
     if (!expanded) {
-        char lobby_balls[64]{};
-        if (g_total_balls > 0) std::snprintf(lobby_balls, sizeof(lobby_balls), "%02d BALLS", g_total_balls);
-        else std::snprintf(lobby_balls, sizeof(lobby_balls), "-- BALLS");
-        draw->AddText(g_font_header, 22.0f, ImVec2(origin.x, origin.y + 47.0f), IM_COL32(244, 213, 44, 255), lobby_balls);
         return;
     }
 
     char time_text[64]{};
     const double displayed_clock = g_finished ? g_finish_time : (g_race_running ? frame_aligned_clock : 0.0);
     format_race_time(displayed_clock, time_text, sizeof(time_text));
-    draw->AddText(g_font_clock, 38.0f, ImVec2(origin.x, origin.y + 43.0f), IM_COL32(255, 255, 255, 255), time_text);
+    draw->AddText(g_font_clock, 38.0f * text_scale, ImVec2(origin.x, origin.y + 43.0f * hud_scale), IM_COL32(255, 255, 255, 255), time_text);
 
     char ball_text[64]{};
     if (g_total_balls > 0) std::snprintf(ball_text, sizeof(ball_text), "BALL %02d / %02d", count, g_total_balls);
     else std::snprintf(ball_text, sizeof(ball_text), "BALL %02d / --", count);
-    const ImVec2 ball_size = g_font_header->CalcTextSizeA(18.0f, FLT_MAX, 0.0f, ball_text);
-    draw->AddText(g_font_header, 18.0f, ImVec2(origin.x + panel_width - 18.0f - ball_size.x, origin.y + 58.0f), IM_COL32(244, 213, 44, 255), ball_text);
+    const float header_size = 18.0f * text_scale;
+    const ImVec2 ball_size = g_font_header->CalcTextSizeA(header_size, FLT_MAX, 0.0f, ball_text);
+    draw->AddText(g_font_header, header_size, ImVec2(origin.x + panel_width - 18.0f * hud_scale - ball_size.x, origin.y + 58.0f * hud_scale),
+        theme_color(g_theme_yellow), ball_text);
 
-    draw->AddLine(ImVec2(origin.x, origin.y + 96.0f), ImVec2(origin.x + panel_width - 20.0f, origin.y + 96.0f), IM_COL32(112, 229, 255, 145), 1.0f);
-    draw->AddText(g_font_body, 14.0f, ImVec2(origin.x + 4.0f, origin.y + 108.0f), IM_COL32(150, 174, 192, 255), "BALL");
-    draw->AddText(g_font_body, 14.0f, ImVec2(origin.x + 74.0f, origin.y + 108.0f), IM_COL32(150, 174, 192, 255), "SPLIT");
-    draw->AddText(g_font_body, 14.0f, ImVec2(origin.x + 324.0f, origin.y + 108.0f), IM_COL32(150, 174, 192, 255), "DELTA");
+    draw->AddLine(ImVec2(origin.x, origin.y + 96.0f * hud_scale), ImVec2(origin.x + panel_width - 20.0f * hud_scale, origin.y + 96.0f * hud_scale),
+        theme_color(g_theme_cyan, 0.57f), std::max(1.0f, hud_scale));
+    const float label_size = 14.0f * text_scale;
+    const ImU32 label_color = theme_color(g_theme_cyan, 0.70f);
+    draw->AddText(g_font_body, label_size, ImVec2(origin.x + 4.0f * hud_scale, origin.y + 108.0f * hud_scale), label_color, "BALL");
+    draw->AddText(g_font_body, label_size, ImVec2(origin.x + 74.0f * hud_scale, origin.y + 108.0f * hud_scale), label_color, "SPLIT");
+    draw->AddText(g_font_body, label_size, ImVec2(origin.x + 324.0f * hud_scale, origin.y + 108.0f * hud_scale), label_color, "DELTA");
 
-    float y = origin.y + 133.0f;
+    float y = origin.y + 133.0f * hud_scale;
     const float capture_age = std::chrono::duration<float>(std::chrono::steady_clock::now() - g_last_ball_time).count();
     const float newest_progress = std::clamp(capture_age / 0.30f, 0.0f, 1.0f);
     const float eased = 1.0f - std::pow(1.0f - newest_progress, 3.0f);
     for (int ball = 1; ball <= count && ball < static_cast<int>(g_splits.size()); ++ball) {
         if (g_splits[ball] <= 0.0) continue;
         const bool newest = ball == count;
-        const float row_y = y + (newest ? (1.0f - eased) * -8.0f : 0.0f);
+        const float row_y = y + (newest ? (1.0f - eased) * -8.0f * hud_scale : 0.0f);
         const int alpha = newest ? static_cast<int>(255.0f * eased) : 255;
-        const ImU32 row_color = newest ? IM_COL32(244, 213, 44, alpha) : IM_COL32(235, 247, 255, alpha);
+        const ImU32 row_color = newest ? theme_color(g_theme_yellow, alpha / 255.0f) : IM_COL32(235, 247, 255, alpha);
         if (newest) {
-            draw->AddRectFilled(ImVec2(origin.x, row_y - 2.0f), ImVec2(origin.x + panel_width - 20.0f, row_y + row_height - 2.0f), IM_COL32(244, 213, 44, static_cast<int>(24.0f * eased)));
+            draw->AddRectFilled(ImVec2(origin.x, row_y - 2.0f * hud_scale),
+                ImVec2(origin.x + panel_width - 20.0f * hud_scale, row_y + row_height - 2.0f * hud_scale),
+                theme_color(g_theme_yellow, (24.0f / 255.0f) * eased));
         }
         char ball_number[16]{};
         char split_time[64]{};
         char delta_text[32]{};
         std::snprintf(ball_number, sizeof(ball_number), "%02d", ball);
         format_race_time(g_splits[ball], split_time, sizeof(split_time));
-        draw->AddText(g_font_body, 16.0f, ImVec2(origin.x + 4.0f, row_y), row_color, ball_number);
-        draw->AddText(g_font_body, 16.0f, ImVec2(origin.x + 74.0f, row_y), row_color, split_time);
+        const float row_font_size = 16.0f * text_scale;
+        draw->AddText(g_font_body, row_font_size, ImVec2(origin.x + 4.0f * hud_scale, row_y), row_color, ball_number);
+        draw->AddText(g_font_body, row_font_size, ImVec2(origin.x + 74.0f * hud_scale, row_y), row_color, split_time);
         if (g_has_reference_pb && g_reference_splits[ball] > 0.0) {
             const double delta = g_splits[ball] - g_reference_splits[ball];
             format_delta(delta, delta_text, sizeof(delta_text));
             const ImU32 delta_color = delta <= 0.0
                 ? IM_COL32(91, 238, 198, alpha)
                 : IM_COL32(255, 111, 111, alpha);
-            const ImVec2 delta_size = g_font_body->CalcTextSizeA(16.0f, FLT_MAX, 0.0f, delta_text);
-            draw->AddText(g_font_body, 16.0f, ImVec2(origin.x + panel_width - 22.0f - delta_size.x, row_y), delta_color, delta_text);
+            const ImVec2 delta_size = g_font_body->CalcTextSizeA(row_font_size, FLT_MAX, 0.0f, delta_text);
+            draw->AddText(g_font_body, row_font_size, ImVec2(origin.x + panel_width - 22.0f * hud_scale - delta_size.x, row_y), delta_color, delta_text);
         } else if (newest) {
             const char* status = g_current_run_is_pb ? "PB" : "LIVE";
-            const ImVec2 status_size = g_font_body->CalcTextSizeA(15.0f, FLT_MAX, 0.0f, status);
-            draw->AddText(g_font_body, 15.0f, ImVec2(origin.x + panel_width - 22.0f - status_size.x, row_y), row_color, status);
+            const float status_font_size = 15.0f * text_scale;
+            const ImVec2 status_size = g_font_body->CalcTextSizeA(status_font_size, FLT_MAX, 0.0f, status);
+            draw->AddText(g_font_body, status_font_size, ImVec2(origin.x + panel_width - 22.0f * hud_scale - status_size.x, row_y), row_color, status);
         }
         y += row_height;
     }
+}
+
+static bool render_arena_overlay() {
+    ID3D12CommandQueue* queue = g_arena_command_queue.load(std::memory_order_acquire);
+    if (!queue || !g_arena_swap_chain || !g_arena_render_list || g_arena_render_frames.empty()) return false;
+    const UINT frame_index = g_arena_swap_chain->GetCurrentBackBufferIndex();
+    if (frame_index >= g_arena_render_frames.size()) return false;
+    ArenaRenderFrame& frame = g_arena_render_frames[frame_index];
+    if (frame.fence_value && g_arena_render_fence->GetCompletedValue() < frame.fence_value) {
+        if (FAILED(g_arena_render_fence->SetEventOnCompletion(frame.fence_value, g_arena_render_event)) ||
+            WaitForSingleObject(g_arena_render_event, 1000) != WAIT_OBJECT_0) return false;
+    }
+
+    ImGui_ImplDX12_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+    draw_proof_of_concept();
+    draw_splitter_settings();
+    ImGui::Render();
+
+    if (FAILED(frame.allocator->Reset()) || FAILED(g_arena_render_list->Reset(frame.allocator, nullptr))) return false;
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = frame.target;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g_arena_render_list->ResourceBarrier(1, &barrier);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_arena_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += static_cast<SIZE_T>(frame_index) * g_arena_rtv_stride;
+    g_arena_render_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    ID3D12DescriptorHeap* heaps[] = {g_arena_srv_heap};
+    g_arena_render_list->SetDescriptorHeaps(1, heaps);
+    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_arena_render_list);
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    g_arena_render_list->ResourceBarrier(1, &barrier);
+    if (FAILED(g_arena_render_list->Close())) return false;
+    ID3D12CommandList* lists[] = {g_arena_render_list};
+    queue->ExecuteCommandLists(1, lists);
+    const UINT64 fence_value = ++g_arena_render_fence_value;
+    if (FAILED(queue->Signal(g_arena_render_fence, fence_value))) return false;
+    frame.fence_value = fence_value;
+    return true;
 }
 
 static HRESULT __stdcall hooked_present(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
@@ -1831,7 +2687,34 @@ static HRESULT __stdcall hooked_present(IDXGISwapChain* swap_chain, UINT sync_in
         ~PresentCallGuard() { g_active_hook_calls.fetch_sub(1, std::memory_order_acq_rel); }
     } guard;
     if (g_arena_reloaded) {
-        read_arena_hud_d3d12(swap_chain);
+        const bool hud_valid = read_arena_hud_d3d12(swap_chain);
+        apply_arena_map_name();
+        if (hud_valid) {
+            const int total = g_arena_total.load(std::memory_order_acquire);
+            if (total > 0) g_total_balls = total;
+            const int finish_count = g_arena_count.load(std::memory_order_acquire);
+            const double finish_clock = g_arena_clock.load(std::memory_order_acquire);
+            if (!g_finished && g_race_running && total > 0 && finish_count >= total) {
+                if (finish_count > 0 && finish_count < static_cast<int>(g_splits.size()) &&
+                    g_splits[finish_count] <= 0.0) {
+                    const double sampled = g_sampled_splits[finish_count].load(std::memory_order_acquire);
+                    g_splits[finish_count] = sampled > 0.0 ? sampled : finish_clock;
+                    g_last_count = finish_count;
+                    g_last_ball_time = std::chrono::steady_clock::now();
+                }
+                g_finished = true;
+                g_race_running = false;
+                g_finish_time = (finish_count < static_cast<int>(g_splits.size()) && g_splits[finish_count] > 0.0)
+                    ? g_splits[finish_count] : finish_clock;
+                commit_personal_best(finish_count);
+            }
+            // The split sampler can land one frame after the visual finish.
+            // Retry until every row is populated and the PB file is written.
+            if (g_finished) commit_personal_best(g_last_count);
+        }
+        if (!g_imgui_ready.load(std::memory_order_acquire))
+            g_imgui_ready.store(initialize_arena_imgui(swap_chain), std::memory_order_release);
+        if (g_imgui_ready.load(std::memory_order_acquire)) render_arena_overlay();
         return g_original_present(swap_chain, sync_interval, flags);
     }
     if (!g_imgui_ready.load()) {
@@ -1950,6 +2833,7 @@ static void* find_execute_command_lists_address() {
 }
 
 static DWORD WINAPI overlay_thread(void*) {
+    load_overlay_settings();
     while (!GetModuleHandleW(L"d3d11.dll")) Sleep(100);
     void* present = find_present_address();
     if (!present || MH_Initialize() != MH_OK) return 1;
@@ -1984,13 +2868,24 @@ static DWORD WINAPI overlay_thread(void*) {
     bool restart_was_down = false;
     auto restart_hold_started = std::chrono::steady_clock::now();
     auto next_locator_check = std::chrono::steady_clock::now();
-    auto arena_last_advanced = std::chrono::steady_clock::now();
-    double arena_previous_clock = -1.0;
-    while (!(GetAsyncKeyState(VK_END) & 1)) {
+    uintptr_t progressing_race = 0;
+    int progressing_count = -1;
+    double progressing_clock = -1.0;
+    auto last_race_progress = std::chrono::steady_clock::now();
+    while (!g_unload_requested.load(std::memory_order_acquire) && !(GetAsyncKeyState(VK_END) & 1)) {
         uintptr_t race = g_race_object.load();
         int count = 0; double clock = 0;
         const bool valid = race && race_sample(race, count, clock);
+        const auto now = std::chrono::steady_clock::now();
+        if (g_arena_reloaded) refresh_arena_map_name();
         if (valid) {
+            if (race != progressing_race || count != progressing_count ||
+                std::abs(clock - progressing_clock) > 0.0001) {
+                progressing_race = race;
+                progressing_count = count;
+                progressing_clock = clock;
+                last_race_progress = now;
+            }
             if (sampled_count < 0) sampled_count = count;
             if (count < sampled_count) {
                 for (auto& split : g_sampled_splits) split.store(0.0, std::memory_order_release);
@@ -2002,14 +2897,9 @@ static DWORD WINAPI overlay_thread(void*) {
                 sampled_count = count;
             }
         }
-
-        const auto now = std::chrono::steady_clock::now();
-        if (g_arena_reloaded && valid) {
-            if (arena_previous_clock < 0.0 || clock > arena_previous_clock + 0.0001 || clock + 0.50 < arena_previous_clock)
-                arena_last_advanced = now;
-            arena_previous_clock = clock;
-        }
-        const bool restart_down = !g_arena_reloaded && g_restart_key_down.load(std::memory_order_acquire);
+        const bool restart_down = !g_arena_reloaded &&
+            !g_settings_open.load(std::memory_order_acquire) &&
+            g_restart_key_down.load(std::memory_order_acquire);
         if (restart_down) {
             if (!restart_was_down) restart_hold_started = now;
             restart_was_down = true;
@@ -2028,17 +2918,8 @@ static DWORD WINAPI overlay_thread(void*) {
         // Lobby objects can retain the just-exited race with a perfectly valid
         // frozen clock. Do not let the background locator re-adopt that stale
         // object after the render thread has cleared it for the lobby.
-        if (g_arena_reloaded && (race <= 1 || !valid || now - arena_last_advanced >= std::chrono::milliseconds(1500)) &&
-            now >= next_locator_check) {
-            const uintptr_t located = locate_arena_race();
-            if (located && located != race) {
-                g_race_object.store(located, std::memory_order_release);
-                sampled_count = -1;
-                arena_previous_clock = -1.0;
-                arena_last_advanced = std::chrono::steady_clock::now();
-            }
-            next_locator_check = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        } else if (!g_arena_reloaded && (!valid || g_finished) &&
+        const bool frozen_race = valid && now - last_race_progress >= std::chrono::milliseconds(1500);
+        if (!g_arena_reloaded && (!valid || g_finished || frozen_race) &&
             !g_in_race_lobby.load(std::memory_order_acquire) &&
             now >= next_locator_check) {
             const uintptr_t located = locate_race();
@@ -2047,8 +2928,13 @@ static DWORD WINAPI overlay_thread(void*) {
                 g_restart_controller.store(0, std::memory_order_release);
                 g_restart_widget.store(0, std::memory_order_release);
                 sampled_count = -1;
+                progressing_race = located;
+                progressing_count = -1;
+                progressing_clock = -1.0;
+                last_race_progress = std::chrono::steady_clock::now();
             }
-            next_locator_check = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+            next_locator_check = std::chrono::steady_clock::now() +
+                (frozen_race ? std::chrono::milliseconds(750) : std::chrono::milliseconds(250));
         } else if (g_in_race_lobby.load(std::memory_order_acquire)) {
             sampled_count = -1;
         }
@@ -2069,6 +2955,7 @@ static DWORD WINAPI overlay_thread(void*) {
     if (g_logo_texture) { g_logo_texture->Release(); g_logo_texture = nullptr; }
     if (g_lobby_probe) { g_lobby_probe->Release(); g_lobby_probe = nullptr; }
     if (g_arena_hud_probe) { g_arena_hud_probe->Release(); g_arena_hud_probe = nullptr; }
+    if (g_arena_reloaded) release_arena_d3d12_renderer();
     release_arena_d3d12_capture();
     if (ID3D12CommandQueue* queue = g_arena_command_queue.exchange(nullptr, std::memory_order_acq_rel)) queue->Release();
     Sleep(100);
