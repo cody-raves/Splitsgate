@@ -12,6 +12,7 @@ in-game timer with per-ball splits and personal-best comparisons.
 - Game-synchronized race timer and ball counter
 - Expanding per-ball split list
 - Personal-best storage and split deltas for every map and difficulty
+- Your saved PB time shown directly in the race HUD in both games
 - Automatic map and difficulty detection in the race lobby
 - Clean lobby reset between runs
 - Hold `R` to restart the active race

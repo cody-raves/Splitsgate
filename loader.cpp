@@ -19,7 +19,7 @@ extern const size_t g_bundled_overlay_dll_size;
 extern const unsigned char g_bundled_logo_png[];
 extern const size_t g_bundled_logo_png_size;
 
-static constexpr wchar_t CURRENT_VERSION[] = L"1.1.1";
+static constexpr wchar_t CURRENT_VERSION[] = L"1.1.2";
 static constexpr wchar_t RELEASE_API[] = L"https://api.github.com/repos/cody-raves/Splitsgate/releases/latest";
 
 struct ReleaseInfo {

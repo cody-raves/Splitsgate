@@ -31,6 +31,7 @@
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
 
 using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
+using ResizeBuffersFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 using ExecuteCommandListsFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using RestartRaceFn = void(__fastcall*)(void*);
 using RestartVisibilityFn = uint8_t(__fastcall*)(void*);
@@ -39,6 +40,7 @@ using MapSelectedExecFn = void(__fastcall*)(void*, void*, void*);
 using MapSelectedFn = void(__fastcall*)(void*, void*);
 
 static PresentFn g_original_present = nullptr;
+static ResizeBuffersFn g_original_resize_buffers = nullptr;
 static std::atomic_int g_active_hook_calls = 0;
 static ExecuteCommandListsFn g_original_execute_command_lists = nullptr;
 static std::atomic<ID3D12CommandQueue*> g_arena_command_queue = nullptr;
@@ -68,6 +70,7 @@ static UINT64 g_arena_render_fence_value = 0;
 static UINT g_arena_rtv_stride = 0;
 static UINT g_arena_srv_stride = 0;
 static std::vector<ArenaRenderFrame> g_arena_render_frames;
+static std::mutex g_arena_dxgi_mutex;
 static bool g_arena_srv_allocated = false;
 static ID3D12Resource* g_arena_logo_resource = nullptr;
 static D3D12_GPU_DESCRIPTOR_HANDLE g_arena_logo_gpu{};
@@ -1829,6 +1832,42 @@ static void release_arena_d3d12_renderer() {
     g_arena_srv_allocated = false;
 }
 
+static bool same_dxgi_object(IDXGISwapChain* left, IDXGISwapChain* right) {
+    if (!left || !right) return false;
+    IUnknown* left_identity = nullptr;
+    IUnknown* right_identity = nullptr;
+    const bool valid = SUCCEEDED(left->QueryInterface(IID_PPV_ARGS(&left_identity))) &&
+        SUCCEEDED(right->QueryInterface(IID_PPV_ARGS(&right_identity)));
+    const bool same = valid && left_identity == right_identity;
+    if (left_identity) left_identity->Release();
+    if (right_identity) right_identity->Release();
+    return same;
+}
+
+static HRESULT __stdcall hooked_resize_buffers(IDXGISwapChain* swap_chain, UINT buffer_count,
+        UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
+    struct ResizeCallGuard {
+        ResizeCallGuard() { g_active_hook_calls.fetch_add(1, std::memory_order_acq_rel); }
+        ~ResizeCallGuard() { g_active_hook_calls.fetch_sub(1, std::memory_order_acq_rel); }
+    } guard;
+    if (!g_arena_reloaded) {
+        return g_original_resize_buffers(swap_chain, buffer_count, width, height, format, flags);
+    }
+
+    std::scoped_lock lock(g_arena_dxgi_mutex);
+    if (same_dxgi_object(swap_chain, g_arena_swap_chain)) {
+        // DXGI requires every reference to the old back buffers to be released
+        // before ResizeBuffers. Menu and display transitions can resize the
+        // Arena swap chain even when the window resolution does not change.
+        if (g_game_window && g_original_wndproc) {
+            SetWindowLongPtrW(g_game_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_original_wndproc));
+            g_original_wndproc = nullptr;
+        }
+        release_arena_d3d12_renderer();
+    }
+    return g_original_resize_buffers(swap_chain, buffer_count, width, height, format, flags);
+}
+
 static bool read_arena_hud_d3d12(IDXGISwapChain* swap_chain) {
     const auto now = std::chrono::steady_clock::now();
     if (now - g_last_arena_hud_probe < std::chrono::milliseconds(15)) {
@@ -2643,6 +2682,21 @@ static void draw_proof_of_concept() {
     draw->AddText(g_font_header, header_size, ImVec2(origin.x + panel_width - 18.0f * hud_scale - ball_size.x, origin.y + 58.0f * hud_scale),
         theme_color(g_theme_yellow), ball_text);
 
+    char pb_text[80]{};
+    const auto personal_best = g_personal_bests.find(profile_key());
+    if (personal_best != g_personal_bests.end() && personal_best->second.finish > 0.0) {
+        char pb_time[64]{};
+        format_race_time(personal_best->second.finish, pb_time, sizeof(pb_time));
+        std::snprintf(pb_text, sizeof(pb_text), "PB %s", pb_time);
+    } else {
+        std::snprintf(pb_text, sizeof(pb_text), "PB --");
+    }
+    const float pb_size = 14.0f * text_scale;
+    const ImVec2 pb_bounds = g_font_header->CalcTextSizeA(pb_size, FLT_MAX, 0.0f, pb_text);
+    draw->AddText(g_font_header, pb_size,
+        ImVec2(origin.x + panel_width - 18.0f * hud_scale - pb_bounds.x, origin.y + 80.0f * hud_scale),
+        theme_color(g_theme_cyan), pb_text);
+
     draw->AddLine(ImVec2(origin.x, origin.y + 96.0f * hud_scale), ImVec2(origin.x + panel_width - 20.0f * hud_scale, origin.y + 96.0f * hud_scale),
         theme_color(g_theme_cyan, 0.57f), std::max(1.0f, hud_scale));
     const float label_size = 14.0f * text_scale;
@@ -2741,34 +2795,37 @@ static HRESULT __stdcall hooked_present(IDXGISwapChain* swap_chain, UINT sync_in
         ~PresentCallGuard() { g_active_hook_calls.fetch_sub(1, std::memory_order_acq_rel); }
     } guard;
     if (g_arena_reloaded) {
-        const bool hud_valid = read_arena_hud_d3d12(swap_chain);
-        apply_arena_map_name();
-        if (hud_valid) {
-            const int total = g_arena_total.load(std::memory_order_acquire);
-            if (total > 0) g_total_balls = total;
-            const int finish_count = g_arena_count.load(std::memory_order_acquire);
-            const double finish_clock = g_arena_clock.load(std::memory_order_acquire);
-            if (!g_finished && g_race_running && total > 0 && finish_count >= total) {
-                if (finish_count > 0 && finish_count < static_cast<int>(g_splits.size()) &&
-                    g_splits[finish_count] <= 0.0) {
-                    const double sampled = g_sampled_splits[finish_count].load(std::memory_order_acquire);
-                    g_splits[finish_count] = sampled > 0.0 ? sampled : finish_clock;
-                    g_last_count = finish_count;
-                    g_last_ball_time = std::chrono::steady_clock::now();
+        {
+            std::scoped_lock lock(g_arena_dxgi_mutex);
+            const bool hud_valid = read_arena_hud_d3d12(swap_chain);
+            apply_arena_map_name();
+            if (hud_valid) {
+                const int total = g_arena_total.load(std::memory_order_acquire);
+                if (total > 0) g_total_balls = total;
+                const int finish_count = g_arena_count.load(std::memory_order_acquire);
+                const double finish_clock = g_arena_clock.load(std::memory_order_acquire);
+                if (!g_finished && g_race_running && total > 0 && finish_count >= total) {
+                    if (finish_count > 0 && finish_count < static_cast<int>(g_splits.size()) &&
+                        g_splits[finish_count] <= 0.0) {
+                        const double sampled = g_sampled_splits[finish_count].load(std::memory_order_acquire);
+                        g_splits[finish_count] = sampled > 0.0 ? sampled : finish_clock;
+                        g_last_count = finish_count;
+                        g_last_ball_time = std::chrono::steady_clock::now();
+                    }
+                    g_finished = true;
+                    g_race_running = false;
+                    g_finish_time = (finish_count < static_cast<int>(g_splits.size()) && g_splits[finish_count] > 0.0)
+                        ? g_splits[finish_count] : finish_clock;
+                    commit_personal_best(finish_count);
                 }
-                g_finished = true;
-                g_race_running = false;
-                g_finish_time = (finish_count < static_cast<int>(g_splits.size()) && g_splits[finish_count] > 0.0)
-                    ? g_splits[finish_count] : finish_clock;
-                commit_personal_best(finish_count);
+                // The split sampler can land one frame after the visual finish.
+                // Retry until every row is populated and the PB file is written.
+                if (g_finished) commit_personal_best(g_last_count);
             }
-            // The split sampler can land one frame after the visual finish.
-            // Retry until every row is populated and the PB file is written.
-            if (g_finished) commit_personal_best(g_last_count);
+            if (!g_imgui_ready.load(std::memory_order_acquire))
+                g_imgui_ready.store(initialize_arena_imgui(swap_chain), std::memory_order_release);
+            if (g_imgui_ready.load(std::memory_order_acquire)) render_arena_overlay();
         }
-        if (!g_imgui_ready.load(std::memory_order_acquire))
-            g_imgui_ready.store(initialize_arena_imgui(swap_chain), std::memory_order_release);
-        if (g_imgui_ready.load(std::memory_order_acquire)) render_arena_overlay();
         return g_original_present(swap_chain, sync_interval, flags);
     }
     if (!g_imgui_ready.load()) {
@@ -2836,7 +2893,9 @@ static LRESULT CALLBACK dummy_wndproc(HWND window, UINT message, WPARAM wparam, 
     return DefWindowProcW(window, message, wparam, lparam);
 }
 
-static void* find_present_address() {
+static bool find_dxgi_hook_addresses(void*& present, void*& resize_buffers) {
+    present = nullptr;
+    resize_buffers = nullptr;
     WNDCLASSEXW wc{sizeof(wc), CS_CLASSDC, dummy_wndproc, 0, 0, GetModuleHandleW(nullptr), nullptr, nullptr, nullptr, nullptr, L"SplitgateOverlayDummy", nullptr};
     RegisterClassExW(&wc);
     HWND window = CreateWindowW(wc.lpszClassName, L"", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
@@ -2856,17 +2915,17 @@ static void* find_present_address() {
     D3D_FEATURE_LEVEL level{};
     const D3D_FEATURE_LEVEL requested[] = {D3D_FEATURE_LEVEL_11_0};
     HRESULT result = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, requested, 1, D3D11_SDK_VERSION, &desc, &swap_chain, &device, &level, &context);
-    void* present = nullptr;
     if (SUCCEEDED(result)) {
         void** vtable = *reinterpret_cast<void***>(swap_chain);
         present = vtable[8];
+        resize_buffers = vtable[13];
     }
     if (context) context->Release();
     if (device) device->Release();
     if (swap_chain) swap_chain->Release();
     DestroyWindow(window);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
-    return present;
+    return present && resize_buffers;
 }
 
 static void* find_execute_command_lists_address() {
@@ -2889,9 +2948,12 @@ static void* find_execute_command_lists_address() {
 static DWORD WINAPI overlay_thread(void*) {
     load_overlay_settings();
     while (!GetModuleHandleW(L"d3d11.dll")) Sleep(100);
-    void* present = find_present_address();
-    if (!present || MH_Initialize() != MH_OK) return 1;
+    void* present = nullptr;
+    void* resize_buffers = nullptr;
+    if (!find_dxgi_hook_addresses(present, resize_buffers) || MH_Initialize() != MH_OK) return 1;
     if (MH_CreateHook(present, &hooked_present, reinterpret_cast<void**>(&g_original_present)) != MH_OK) return 2;
+    if (g_arena_reloaded && MH_CreateHook(resize_buffers, &hooked_resize_buffers,
+            reinterpret_cast<void**>(&g_original_resize_buffers)) != MH_OK) return 9;
     if (g_arena_reloaded) {
         void* execute_command_lists = find_execute_command_lists_address();
         if (!execute_command_lists || MH_CreateHook(execute_command_lists, &hooked_execute_command_lists,
