@@ -59,8 +59,22 @@ The zip also contains `Splitsgate-Splitgate1.exe` and
 three EXEs contain the same overlay and share the same settings and PB files.
 
 Personal-best data and settings are kept in `%LOCALAPPDATA%\Splitsgate\Runtime`.
+
+## Crash diagnostics
+
+Anonymous crash reporting is optional and disabled by default. Enable **Send
+anonymous crash reports** in the overlay settings to let the launcher report an
+abnormal game-process exit. Reports contain the Splitsgate version, game name,
+Windows exit code, and HUD layout values. They do not include usernames,
+personal-best files, screenshots, or memory dumps.
+
+Reports that cannot be sent are retained in
+`%LOCALAPPDATA%\Splitsgate\Runtime\CrashReports`. The report service URL can be
+provided through `%LOCALAPPDATA%\Splitsgate\Runtime\crash-report-endpoint.txt`
+or the `SPLITSGATE_CRASH_REPORT_URL` environment variable.
+
 On startup, the launcher checks the latest GitHub release. If a newer version
-is available, it offers to download, replace, and relaunch the single EXE
+is available, it downloads, replaces, and relaunches the single EXE
 before loading the overlay. Release builds should attach `Splitsgate.exe` as a
 GitHub release asset; zip assets remain supported for older releases.
 

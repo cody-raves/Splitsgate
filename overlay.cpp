@@ -155,6 +155,7 @@ static float g_arena_hud_scale = 1.0f;
 static float g_sg1_hud_scale = 1.0f;
 static float g_arena_text_scale = 1.0f;
 static float g_sg1_text_scale = 1.0f;
+static bool g_automatic_crash_reports = false;
 static float g_theme_background[4] = {3.0f / 255.0f, 17.0f / 255.0f, 29.0f / 255.0f, 225.0f / 255.0f};
 static float g_theme_border[4] = {10.0f / 255.0f, 38.0f / 255.0f, 58.0f / 255.0f, 1.0f};
 static float g_theme_cyan[4] = {112.0f / 255.0f, 229.0f / 255.0f, 1.0f, 1.0f};
@@ -656,6 +657,7 @@ static void load_overlay_settings() {
         else if (key == "sg1_hud_scale" || key == "sg1_minimal_scale") g_sg1_hud_scale = std::strtof(value.c_str(), nullptr);
         else if (key == "arena_text_scale" || key == "arena_minimal_text_scale") g_arena_text_scale = std::strtof(value.c_str(), nullptr);
         else if (key == "sg1_text_scale" || key == "sg1_minimal_text_scale") g_sg1_text_scale = std::strtof(value.c_str(), nullptr);
+        else if (key == "automatic_crash_reports") g_automatic_crash_reports = std::atoi(value.c_str()) != 0;
         else if (key == "theme_background") std::sscanf(value.c_str(), "%f,%f,%f,%f", &g_theme_background[0], &g_theme_background[1], &g_theme_background[2], &g_theme_background[3]);
         else if (key == "theme_border") std::sscanf(value.c_str(), "%f,%f,%f,%f", &g_theme_border[0], &g_theme_border[1], &g_theme_border[2], &g_theme_border[3]);
         else if (key == "theme_cyan") std::sscanf(value.c_str(), "%f,%f,%f,%f", &g_theme_cyan[0], &g_theme_cyan[1], &g_theme_cyan[2], &g_theme_cyan[3]);
@@ -685,6 +687,7 @@ static void save_overlay_settings() {
            << "sg1_hud_scale=" << g_sg1_hud_scale << '\n'
            << "arena_text_scale=" << g_arena_text_scale << '\n'
            << "sg1_text_scale=" << g_sg1_text_scale << '\n'
+           << "automatic_crash_reports=" << (g_automatic_crash_reports ? 1 : 0) << '\n'
            << "theme_background=" << g_theme_background[0] << ',' << g_theme_background[1] << ',' << g_theme_background[2] << ',' << g_theme_background[3] << '\n'
            << "theme_border=" << g_theme_border[0] << ',' << g_theme_border[1] << ',' << g_theme_border[2] << ',' << g_theme_border[3] << '\n'
            << "theme_cyan=" << g_theme_cyan[0] << ',' << g_theme_cyan[1] << ',' << g_theme_cyan[2] << ',' << g_theme_cyan[3] << '\n'
@@ -1553,7 +1556,11 @@ static std::vector<HudGlyph> find_hud_glyphs(
             // The compact counter's digit 1 is only a few pixels wide. Keep
             // its full-height stem while the height test still rejects the
             // slash, punctuation, and sparkle noise around the HUD.
+            // The timer card's tall right border can enter the proportional
+            // crop at 1080p. It is much taller than a digit, so reject it
+            // before enforcing the six-glyph timer sequence.
             if (glyph_height >= std::max(8, scan_height / 5) &&
+                glyph_height <= std::max(12, scan_height * 4 / 5) &&
                 glyph_width >= 2 && glyph_width <= std::max(12, width * 3 / 20) && glyph.area >= 12) {
                 result.push_back(glyph);
             }
@@ -1614,8 +1621,11 @@ static std::vector<HudGlyph> find_hud_counter_glyphs(
         }
         const int glyph_width = glyph.right - glyph.left;
         const int glyph_height = glyph.bottom - glyph.top;
+        const float glyph_density = glyph_width > 0 && glyph_height > 0
+            ? static_cast<float>(glyph.area) / static_cast<float>(glyph_width * glyph_height)
+            : 0.0f;
         if (glyph_height >= std::max(8, scan_height / 5) && glyph_width >= 2 &&
-            glyph_width <= std::max(18, width * 3 / 20) && glyph.area >= 12) {
+            glyph_width <= std::max(18, width * 3 / 20) && glyph.area >= 12 && glyph_density >= 0.12f) {
             result.push_back(glyph);
         }
     }
@@ -1664,7 +1674,7 @@ static int read_hud_digit(const unsigned char* pixels, UINT row_pitch, const Hud
 
 static bool parse_arena_hud_pixels(const unsigned char* pixels, UINT row_pitch, int width, int height) {
     auto timer_glyphs = find_hud_glyphs(pixels, row_pitch, width, height,
-        width / 12, 0, width * 11 / 12, height * 38 / 100, HudInk::dark);
+        0, 0, width * 93 / 100, height * 38 / 100, HudInk::dark);
     bool timer_valid = timer_glyphs.size() == 6;
     int timer_digits[6]{};
     if (timer_valid) {
@@ -1686,12 +1696,16 @@ static bool parse_arena_hud_pixels(const unsigned char* pixels, UINT row_pitch, 
     // Restrict the counter scan to the text baseline. The larger region also
     // contains the checkmark, slash, and bright HUD border, which can bridge
     // otherwise separate digit columns into one false glyph.
-    const int counter_top = height * 62 / 100;
-    const int counter_bottom = height * 90 / 100;
+    // At 1080p the counter sits at the bottom of this crop. Start below the
+    // white timer card and include the full lower strokes of values such as
+    // 4/39. Tight horizontal bounds keep the slash out of the current count
+    // and preserve both digits of the total.
+    const int counter_top = height * 70 / 100;
+    const int counter_bottom = height;
     auto yellow = find_hud_counter_glyphs(pixels, row_pitch, width, height,
         width / 5, counter_top, width / 2, counter_bottom, HudInk::yellow);
     auto white = find_hud_counter_glyphs(pixels, row_pitch, width, height,
-        width * 57 / 100, counter_top, width * 9 / 10, counter_bottom, HudInk::white);
+        width * 48 / 100, counter_top, width * 9 / 10, counter_bottom, HudInk::white);
     // The checkmark and slash sit immediately to the left of the values and
     // can satisfy the same color/height tests. Counter digits are always the
     // rightmost one or two glyphs in each half of the HUD.
@@ -2342,6 +2356,8 @@ static void draw_splitter_settings() {
     }
     ImGui::TextDisabled("Drag the HUD itself anywhere while this menu is open.");
     ImGui::TextDisabled("Dragged positions save automatically.");
+    if (ImGui::Checkbox("Send anonymous crash reports", &g_automatic_crash_reports)) save_overlay_settings();
+    ImGui::TextDisabled("Sends the game, exit code, and layout settings only.");
     if (!g_arena_reloaded) {
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.44f, 0.90f, 1.0f, 1.0f), "RACE CONTROLS");
@@ -2447,6 +2463,16 @@ static void draw_proof_of_concept() {
         if (!g_arena_reloaded && g_previous_clock >= 0.0 && clock >= g_previous_clock &&
             clock - g_previous_clock < 0.10) {
             frame_aligned_clock = g_previous_clock;
+        }
+        // The SG2 counter is recognized from the rendered HUD. A single noisy
+        // frame can resemble a smaller number; treating that as a restart
+        // erased every earlier split and then repopulated only the newest rows.
+        // A real restart always returns both the counter and clock to zero, so
+        // preserve the last confirmed count unless those signals agree.
+        if (g_arena_reloaded && g_last_count >= 0 && count < g_last_count) {
+            const bool confirmed_restart = count == 0 && clock < 1.0 &&
+                g_previous_clock > 1.5 && clock + 0.75 < g_previous_clock;
+            if (!confirmed_restart) count = g_last_count;
         }
         // The sampler runs independently of Present and normally observes the
         // count transition within the same millisecond. Pull those timestamps

@@ -6,6 +6,7 @@
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -19,8 +20,14 @@ extern const size_t g_bundled_overlay_dll_size;
 extern const unsigned char g_bundled_logo_png[];
 extern const size_t g_bundled_logo_png_size;
 
-static constexpr wchar_t CURRENT_VERSION[] = L"1.1.2";
+static constexpr wchar_t CURRENT_VERSION[] = L"1.1.3";
+static constexpr char CURRENT_VERSION_UTF8[] = "1.1.3";
 static constexpr wchar_t RELEASE_API[] = L"https://api.github.com/repos/cody-raves/Splitsgate/releases/latest";
+
+struct GameProcess {
+    DWORD pid = 0;
+    std::wstring name;
+};
 
 struct ReleaseInfo {
     std::wstring version;
@@ -33,6 +40,16 @@ static std::wstring utf8_to_wide(const std::string& value) {
     const int length = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
     std::wstring result(length, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), length);
+    return result;
+}
+
+static std::string wide_to_utf8(const std::wstring& value) {
+    if (value.empty()) return {};
+    const int length = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+        nullptr, 0, nullptr, nullptr);
+    std::string result(length, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+        result.data(), length, nullptr, nullptr);
     return result;
 }
 
@@ -78,6 +95,40 @@ static std::optional<std::vector<unsigned char>> http_get(const std::wstring& ur
     WinHttpCloseHandle(connection);
     WinHttpCloseHandle(session);
     return ok ? std::optional<std::vector<unsigned char>>(std::move(result)) : std::nullopt;
+}
+
+static bool http_post_json(const std::wstring& url, const std::string& body) {
+    URL_COMPONENTS parts{sizeof(parts)};
+    wchar_t host[256]{};
+    wchar_t path[2048]{};
+    parts.lpszHostName = host;
+    parts.dwHostNameLength = static_cast<DWORD>(std::size(host));
+    parts.lpszUrlPath = path;
+    parts.dwUrlPathLength = static_cast<DWORD>(std::size(path));
+    parts.dwSchemeLength = 1;
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts)) return false;
+    HINTERNET session = WinHttpOpen(L"Splitsgate-CrashReporter/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) return false;
+    WinHttpSetTimeouts(session, 5000, 5000, 10000, 15000);
+    HINTERNET connection = WinHttpConnect(session, std::wstring(host, parts.dwHostNameLength).c_str(), parts.nPort, 0);
+    if (!connection) { WinHttpCloseHandle(session); return false; }
+    const DWORD flags = parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET request = WinHttpOpenRequest(connection, L"POST", std::wstring(path, parts.dwUrlPathLength).c_str(),
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!request) { WinHttpCloseHandle(connection); WinHttpCloseHandle(session); return false; }
+    const wchar_t headers[] = L"Content-Type: application/json\r\nAccept: application/json\r\n";
+    bool ok = WinHttpSendRequest(request, headers, static_cast<DWORD>(-1),
+        const_cast<char*>(body.data()), static_cast<DWORD>(body.size()), static_cast<DWORD>(body.size()), 0) &&
+        WinHttpReceiveResponse(request, nullptr);
+    DWORD status = 0;
+    DWORD status_size = sizeof(status);
+    if (ok) ok = WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size, WINHTTP_NO_HEADER_INDEX) && status >= 200 && status < 300;
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connection);
+    WinHttpCloseHandle(session);
+    return ok;
 }
 
 static std::string json_string(const std::string& json, const std::string& key, size_t start = 0) {
@@ -231,6 +282,136 @@ static std::filesystem::path runtime_directory() {
     return std::filesystem::temp_directory_path() / L"Splitsgate" / L"Runtime";
 }
 
+static std::string json_escape(const std::string& value) {
+    std::ostringstream escaped;
+    for (const unsigned char character : value) {
+        switch (character) {
+        case '\\': escaped << "\\\\"; break;
+        case '"': escaped << "\\\""; break;
+        case '\n': escaped << "\\n"; break;
+        case '\r': escaped << "\\r"; break;
+        case '\t': escaped << "\\t"; break;
+        default:
+            if (character < 0x20) escaped << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(character);
+            else escaped << static_cast<char>(character);
+        }
+    }
+    return escaped.str();
+}
+
+static bool automatic_crash_reports_enabled(const std::filesystem::path& runtime) {
+    std::ifstream input(runtime / L"splitgate-overlay-settings.ini");
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line == "automatic_crash_reports=1") return true;
+        if (line == "automatic_crash_reports=0") return false;
+    }
+    return false;
+}
+
+static std::wstring crash_report_endpoint(const std::filesystem::path& runtime) {
+    wchar_t environment[2048]{};
+    const DWORD length = GetEnvironmentVariableW(L"SPLITSGATE_CRASH_REPORT_URL", environment, static_cast<DWORD>(std::size(environment)));
+    if (length > 0 && length < std::size(environment)) return environment;
+    std::wifstream input(runtime / L"crash-report-endpoint.txt");
+    std::wstring endpoint;
+    std::getline(input, endpoint);
+    while (!endpoint.empty() && iswspace(endpoint.back())) endpoint.pop_back();
+    return endpoint;
+}
+
+static std::string utc_timestamp() {
+    SYSTEMTIME time{};
+    GetSystemTime(&time);
+    char buffer[40]{};
+    std::snprintf(buffer, sizeof(buffer), "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond, time.wMilliseconds);
+    return buffer;
+}
+
+static std::string sanitized_settings_json(const std::filesystem::path& runtime) {
+    static constexpr const char* allowed[] = {
+        "arena_hud_scale", "sg1_hud_scale", "arena_text_scale", "sg1_text_scale",
+        "arena_panel_x", "arena_panel_y", "sg1_panel_x", "sg1_panel_y",
+        "arena_hide_outside_race"
+    };
+    std::ifstream input(runtime / L"splitgate-overlay-settings.ini");
+    std::ostringstream json;
+    json << '{';
+    bool first = true;
+    std::string line;
+    while (std::getline(input, line)) {
+        const size_t separator = line.find('=');
+        if (separator == std::string::npos) continue;
+        const std::string key = line.substr(0, separator);
+        if (std::find(std::begin(allowed), std::end(allowed), key) == std::end(allowed)) continue;
+        const std::string value = line.substr(separator + 1);
+        if (!first) json << ',';
+        first = false;
+        json << '"' << json_escape(key) << "\":\"" << json_escape(value) << '"';
+    }
+    json << '}';
+    return json.str();
+}
+
+static bool is_probable_crash_exit(DWORD exit_code) {
+    return exit_code != 0 && exit_code != STILL_ACTIVE;
+}
+
+static int monitor_game_process(DWORD pid, const std::wstring& game_name) {
+    HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return 1;
+    WaitForSingleObject(process, INFINITE);
+    DWORD exit_code = 0;
+    const bool have_exit_code = GetExitCodeProcess(process, &exit_code) != FALSE;
+    CloseHandle(process);
+    if (!have_exit_code || !is_probable_crash_exit(exit_code)) return 0;
+
+    const std::filesystem::path runtime = runtime_directory();
+    std::error_code ec;
+    const std::filesystem::path pending = runtime / L"CrashReports";
+    std::filesystem::create_directories(pending, ec);
+    std::ostringstream code;
+    code << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << exit_code;
+    const std::string timestamp = utc_timestamp();
+    const std::string game = wide_to_utf8(game_name);
+    std::ostringstream report;
+    report << "{\n"
+           << "  \"schema_version\": 1,\n"
+           << "  \"kind\": \"game_process_exit\",\n"
+           << "  \"timestamp_utc\": \"" << timestamp << "\",\n"
+           << "  \"splitsgate_version\": \"" << CURRENT_VERSION_UTF8 << "\",\n"
+           << "  \"game\": \"" << json_escape(game) << "\",\n"
+           << "  \"exit_code\": \"" << code.str() << "\",\n"
+           << "  \"settings\": " << sanitized_settings_json(runtime) << "\n"
+           << "}\n";
+    std::string filename = timestamp;
+    std::replace(filename.begin(), filename.end(), ':', '-');
+    const std::filesystem::path report_path = pending / utf8_to_wide("crash-" + filename + ".json");
+    std::ofstream output(report_path, std::ios::binary | std::ios::trunc);
+    output << report.str();
+    output.close();
+
+    if (!automatic_crash_reports_enabled(runtime)) return 0;
+    const std::wstring endpoint = crash_report_endpoint(runtime);
+    if (!endpoint.empty() && http_post_json(endpoint, report.str())) std::filesystem::remove(report_path, ec);
+    return 0;
+}
+
+static bool start_crash_monitor(const std::filesystem::path& executable, const GameProcess& game) {
+    std::wstring command = L"\"" + executable.wstring() + L"\" --monitor " + std::to_wstring(game.pid) +
+        L" \"" + game.name + L"\"";
+    STARTUPINFOW startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+            CREATE_NO_WINDOW, nullptr, executable.parent_path().c_str(), &startup, &process)) return false;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
+}
+
 static bool payload_matches(const std::filesystem::path& path, const unsigned char* payload, size_t size) {
     std::error_code ec;
     if (!std::filesystem::exists(path, ec) || std::filesystem::file_size(path, ec) != size) return false;
@@ -274,11 +455,6 @@ static void migrate_user_file(const std::filesystem::path& old_directory,
 }
 
 enum class TargetMode { Dual, Splitgate1, Splitgate2 };
-
-struct GameProcess {
-    DWORD pid = 0;
-    std::wstring name;
-};
 
 static TargetMode target_mode_for(const std::filesystem::path& executable) {
     std::wstring name = executable.stem().wstring();
@@ -337,6 +513,9 @@ int wmain(int argc, wchar_t** argv) {
     wchar_t executable_buffer[MAX_PATH]{};
     GetModuleFileNameW(nullptr, executable_buffer, MAX_PATH);
     const std::filesystem::path executable = executable_buffer;
+    if (argc >= 4 && _wcsicmp(argv[1], L"--monitor") == 0) {
+        return monitor_game_process(static_cast<DWORD>(_wcstoui64(argv[2], nullptr, 10)), argv[3]);
+    }
     if (check_for_update(executable)) return 0;
 
     const std::filesystem::path runtime = runtime_directory();
@@ -365,7 +544,11 @@ int wmain(int argc, wchar_t** argv) {
     }
     const std::wstring path = dll.wstring();
     bool success = true;
-    for (const GameProcess& game : games) success = inject_overlay(game.pid, path) && success;
+    for (const GameProcess& game : games) {
+        const bool injected = inject_overlay(game.pid, path);
+        if (injected) start_crash_monitor(executable, game);
+        success = injected && success;
+    }
     if (!success) {
         MessageBoxW(nullptr, L"The overlay could not be loaded. Unload any existing copy and try again.",
             L"Splitsgate", MB_ICONERROR | MB_OK | MB_SETFOREGROUND);
