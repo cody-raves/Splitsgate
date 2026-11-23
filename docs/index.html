@@ -1,171 +1,34 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="Splitsgate is a race splits overlay built by and for the Splitgate race community, with support for Splitgate 1 and Splitgate 2.">
-  <meta name="theme-color" content="#071522">
-  <title>Splitsgate — Community Race Overlay</title>
-  <link rel="stylesheet" href="styles.css">
-  <link rel="stylesheet" href="logos.css">
-  <link rel="stylesheet" href="screenshots.css">
-</head>
-<body>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="description" content="Splitsgate — the community race overlay for Splitgate 1 and 2."><meta name="theme-color" content="#0a0f0e"><title>Splitsgate — Community Race Overlay</title><link rel="stylesheet" href="styles.css"></head>
+<body><div class="loader" aria-label="Entering Splitsgate"><span class="loader-name">SPLITS / GATE</span><img src="assets/splitgate-mark.png" alt=""><p>ENTERING THE RACE</p><button type="button">ESC TO SKIP</button><i></i></div><div class="site">
   <header class="nav">
-    <a class="brand" href="#top" aria-label="Splitsgate home"><img class="brand-mark" src="assets/splitgate-mark.png" alt=""><span>Splitsgate</span></a>
-    <nav aria-label="Main navigation">
-      <a href="#screenshots">Screenshots</a><a href="#setup">Setup</a><a href="#controls">Controls</a><a href="#help">Help</a>
-      <a class="nav-github" href="https://github.com/cody-raves/Splitsgate">GitHub</a>
-    </nav>
+    <a class="brand" href="https://github.com/cody-raves/Splitsgate"><img src="assets/splitgate-mark.png" alt=""><b>SPLITS<br>GATE</b></a>
+    <div class="status"><i></i><span>RACE SYSTEM / ONLINE</span></div>
+    <nav><a href="about.html">ABOUT</a><a href="https://github.com/cody-raves/Splitsgate">SOURCE</a><a href="https://discord.gg/WHH94nyhW8">DISCORD</a><a class="download" href="https://github.com/cody-raves/Splitsgate/releases/latest/download/Splitsgate.zip">DOWNLOAD <b>↗</b></a></nav>
   </header>
-
-  <main id="top">
-    <section class="hero">
-      <div class="hero-copy">
-        <p class="eyebrow"><span></span> Built by racers, for racers</p>
-        <h1>Race splits,<br><em>made for the community.</em></h1>
-        <p class="lead">Splitsgate is a tool built by and for the Splitgate race community. It tracks your timer, ball splits, deltas, and personal bests in both Splitgate games.</p>
-        <div class="hero-actions">
-          <a id="download-primary" class="button primary" href="https://github.com/cody-raves/Splitsgate/releases/latest/download/Splitsgate.zip">Download Splitsgate</a>
-          <a class="button secondary" href="#screenshots">See it in-game</a>
-        </div>
-        <p class="release-note"><span id="release-dot"></span><span id="release-label">Windows 10/11 · latest release zip</span></p>
-      </div>
-      <div class="hud-demo" aria-label="Animated example of the Splitsgate overlay">
-        <div class="scan"></div>
-        <div class="game-label">SIMULATION CHARLIE</div>
-        <img class="demo-logo" src="assets/splitgate-mark.png" alt="Splitgate mark">
-        <div class="race-orb"></div>
-        <div class="hud-card">
-          <div class="hud-title"><span>SIMULATION CHARLIE // RACE</span><b>04 / 15</b></div>
-          <div class="yellow-rule"></div>
-          <div class="hud-time">0:07.140</div>
-          <div class="hud-cols"><span>BALL</span><span>SPLIT</span><span>DELTA</span></div>
-          <div class="split"><b>01</b><span>0:01.530</span><i class="bad">+0.100</i></div>
-          <div class="split"><b>02</b><span>0:02.130</span><i>+0.000</i></div>
-          <div class="split"><b>03</b><span>0:02.730</span><i class="bad">+0.090</i></div>
-          <div class="split current"><b>04</b><span>0:02.930</span><i>-0.210</i></div>
-        </div>
-      </div>
+  <main>
+    <section class="hero-copy">
+      <p class="micro">COMMUNITY-BUILT RACE OVERLAY</p>
+      <h1>SPLITS<br><em>GATE.</em></h1>
+      <img class="hero-hud hero-hud-asset" src="assets/hud-stadium-trimmed.png" alt="Splitsgate HUD showing Stadium Medium, a 0:06.224 time, and three ball splits">
+      <p class="tagline">RACE THE CLOCK / CHASE THE PERFECT RUN / 2026</p>
     </section>
-
-    <section class="trust-strip" aria-label="Project highlights">
-      <div><strong>COMMUNITY BUILT</strong><span>Created for Splitgate racers</span></div>
-      <div><strong>BOTH GAMES</strong><span>Splitgate 1 and Splitgate 2</span></div>
-      <div><strong>YOUR PBS</strong><span>Saved safely between updates</span></div>
+    <section class="field">
+      <div class="field-label"><span>SG / FIELD 001</span><b><i></i> LIVE</b></div>
+      <div class="field-image"></div><div class="field-pattern"></div>
+      <p>EVERY ORB. EVERY SPLIT. EVERY SECOND.</p>
     </section>
-
-    <section id="screenshots" class="section screenshots">
-      <div class="section-heading">
-        <p class="eyebrow"><span></span> Real in-game screenshots</p>
-        <h2>See it during an actual race.</h2>
-        <p>These are real captures from community testing—not concept art. The overlay stays readable while keeping the course and the game’s own HUD visible.</p>
-      </div>
-      <div class="screenshot-grid">
-        <figure class="screenshot-card featured">
-          <a href="assets/in-game-splitgate1.webp" target="_blank" rel="noopener"><img src="assets/in-game-splitgate1.webp" alt="Current Splitsgate overlay showing live splits and deltas during a Splitgate 1 race" loading="lazy"></a>
-          <figcaption><div><strong>Splitgate 1</strong><span>Live splits, deltas, and matching race controls</span></div><b>Open full size</b></figcaption>
-        </figure>
-        <figure class="screenshot-card">
-          <a href="assets/in-game-splitgate2.webp" target="_blank" rel="noopener"><img src="assets/in-game-splitgate2.webp" alt="Current Splitsgate overlay showing a completed Splitgate 2 race with full split history and personal-best deltas" loading="lazy"></a>
-          <figcaption><div><strong>Splitgate 2</strong><span>Full run history and PB deltas at the finish</span></div><b>Open full size</b></figcaption>
-        </figure>
-        <figure class="screenshot-card">
-          <a href="assets/settings-menu.webp" target="_blank" rel="noopener"><img src="assets/settings-menu.webp" alt="Current Splitsgate settings menu for customizing colors, keybind, scale, text size, and HUD position" loading="lazy"></a>
-          <figcaption><div><strong>Customize it</strong><span>Colors, keybind, scale, text size, and position</span></div><b>Open full size</b></figcaption>
-        </figure>
-        <figure class="screenshot-card wide">
-          <a href="assets/color-customization.webp" target="_blank" rel="noopener"><img src="assets/color-customization.webp" alt="Splitsgate color picker showing a live purple HUD preview in Splitgate 2" loading="lazy"></a>
-          <figcaption><div><strong>Make it yours</strong><span>Pick custom colors and preview the HUD instantly</span></div><b>Open full size</b></figcaption>
-        </figure>
-      </div>
-    </section>
-
-    <section id="setup" class="section setup">
-      <div class="section-heading">
-        <p class="eyebrow"><span></span> Simple community setup guide</p>
-        <h2>Get racing in three steps.</h2>
-        <p>You do not need to install a mod manager, move a DLL, or edit a config file.</p>
-      </div>
-
-      <div class="tutorial">
-        <div class="tutorial-stage" aria-live="polite">
-          <div class="desktop-grid"></div>
-          <div class="scene scene-download active" data-scene="0">
-            <div class="browser-window">
-              <div class="window-bar"><i></i><i></i><i></i><span>Downloads</span></div>
-              <div class="download-file"><span class="zip-icon">ZIP</span><div><b>Splitsgate.zip</b><small>GitHub release</small></div><em>✓</em></div>
-              <div class="cursor cursor-one"></div>
-            </div>
-          </div>
-          <div class="scene scene-game" data-scene="1">
-            <div class="game-window"><div class="game-logo"><img src="assets/splitgate-mark.png" alt=""><strong>SPLITGATE</strong></div><p>Start the game and wait for the menu.</p><div class="status-pill">GAME RUNNING</div></div>
-            <div class="cursor cursor-two"></div>
-          </div>
-          <div class="scene scene-launch" data-scene="2">
-            <div class="folder-window">
-              <div class="window-bar"><i></i><i></i><i></i><span>Splitsgate</span></div>
-              <div class="exe-file"><span class="exe-icon"><img src="assets/splitgate-mark.png" alt=""></span><b>Splitsgate.exe</b><small>Double-click</small></div>
-              <div class="mini-overlay">HUD LOADED <span>✓</span></div>
-            </div>
-            <div class="cursor cursor-three"></div>
-          </div>
-        </div>
-
-        <div class="tutorial-steps" role="tablist" aria-label="Setup tutorial steps">
-          <button class="tutorial-step active" data-step="0" role="tab" aria-selected="true"><b>1</b><span><strong>Download and unzip</strong><small>Click Download above, then extract <code>Splitsgate.zip</code>.</small></span></button>
-          <button class="tutorial-step" data-step="1" role="tab" aria-selected="false"><b>2</b><span><strong>Start your game</strong><small>Open Splitgate 1 or Splitgate 2 normally.</small></span></button>
-          <button class="tutorial-step" data-step="2" role="tab" aria-selected="false"><b>3</b><span><strong>Open Splitsgate.exe</strong><small>Use the dual launcher. The HUD appears automatically.</small></span></button>
-          <button id="tutorial-toggle" class="pause" type="button" aria-label="Pause animated tutorial">Pause animation</button>
-        </div>
-      </div>
-
-      <aside class="windows-note"><b>Windows protected your PC?</b><span>Click <strong>More info</strong>, then <strong>Run anyway</strong>. Windows may show this because Splitsgate is a small community tool, not because setup requires extra files.</span></aside>
-    </section>
-
-    <section class="section launchers">
-      <div class="section-heading compact"><p class="eyebrow"><span></span> Inside the zip</p><h2>Which launcher do I use?</h2></div>
-      <div class="launcher-grid">
-        <article class="launcher recommended"><img class="launcher-logo" src="assets/splitgate-mark.png" alt=""><span class="tag">RECOMMENDED</span><h3>Splitsgate.exe</h3><p>Automatically finds Splitgate 1 or Splitgate 2. This is the right choice for almost everyone.</p></article>
-        <article class="launcher"><img class="launcher-logo" src="assets/splitgate-mark.png" alt=""><span class="game-number">01</span><h3>Splitsgate-Splitgate1.exe</h3><p>Only looks for the original Splitgate. Useful if both games happen to be open.</p></article>
-        <article class="launcher"><img class="launcher-logo" src="assets/splitgate-mark.png" alt=""><span class="game-number">02</span><h3>Splitsgate-Splitgate2.exe</h3><p>Only looks for Splitgate 2. It uses the same settings and PB storage.</p></article>
-      </div>
-    </section>
-
-    <section id="controls" class="section controls">
-      <div class="section-heading compact"><p class="eyebrow"><span></span> In-game controls</p><h2>Two things to remember.</h2></div>
-      <div class="control-grid">
-        <article><div class="key"><span>HOLD</span>R</div><div><h3>Restart the race</h3><p>Hold R until the small progress bar fills. Release early to cancel.</p></div></article>
-        <article><div class="key"><span>2×</span>R</div><div><h3>Open settings</h3><p>Tap R twice quickly to move, resize, recolor, or unload the HUD.</p></div></article>
-      </div>
-    </section>
-
-    <section class="section saves">
-      <div><p class="eyebrow"><span></span> Your data</p><h2>Updates do not erase your PBs.</h2><p>The launcher is one downloadable EXE, but your writable personal-best and settings files live safely in your Windows profile.</p></div>
-      <div class="path-card"><span>Saved automatically in</span><code>%LOCALAPPDATA%\Splitsgate\Runtime</code><ul><li>splitgate-personal-bests.tsv</li><li>splitgate-overlay-settings.ini</li></ul></div>
-    </section>
-
-    <section id="help" class="section help">
-      <div class="section-heading compact"><p class="eyebrow"><span></span> Quick fixes</p><h2>If something doesn’t work.</h2></div>
-      <div class="faq">
-        <details><summary>The HUD did not appear.<span>+</span></summary><p>Make sure the game is already running, then open the launcher again. Use the dual <code>Splitsgate.exe</code> unless you have a specific reason not to.</p></details>
-        <details><summary>I downloaded an update. What happens next?<span>+</span></summary><p>On launch, Splitsgate checks GitHub. When a new version is available, it downloads the matching EXE, replaces itself, relaunches, and then loads the HUD. It never interrupts a race.</p></details>
-        <details><summary>How do I remove the overlay?<span>+</span></summary><p>Press <code>End</code> in-game, or double-tap R and choose <strong>Unload Overlay</strong>. Closing the game also unloads it.</p></details>
-        <details><summary>Where can I report a bug?<span>+</span></summary><p>Open an issue on <a href="https://github.com/cody-raves/Splitsgate/issues">GitHub Issues</a> and include the game, map, difficulty, and a screenshot.</p></details>
-      </div>
-    </section>
-
-    <section class="final-cta">
-      <p>Built for the race community</p>
-      <h2>Bring your next run to life.</h2>
-      <div class="hero-actions community-actions">
-        <a class="button primary download-mirror" href="https://github.com/cody-raves/Splitsgate/releases/latest/download/Splitsgate.zip">Download Splitsgate</a>
-        <a class="button secondary" href="https://discord.gg/WHH94nyhW8" target="_blank" rel="noopener">Join the racers Discord</a>
-      </div>
+    <section class="signal" aria-hidden="true"><div class="signal-image"></div><div class="signal-pattern"></div><span>/ THE RUN</span><b>S</b></section>
+    <section class="about">
+      <article class="about-copy">
+        <p class="micro">/ THE OVERLAY</p>
+        <h2>A race HUD built for the next personal best.</h2>
+        <p>Live splits, PB deltas, and verified community leaderboards for Splitgate 1 + 2.</p>
+        <div class="actions"><a class="primary" href="https://github.com/cody-raves/Splitsgate/releases/latest/download/Splitsgate.zip">GET SPLITSGATE <b>↓</b></a><a href="https://github.com/cody-raves/Splitsgate">VIEW ON GITHUB <b>↗</b></a></div>
+      </article>
+      <article class="feature">
+        <p class="micro">/ YOUR RUN</p><h2>Your splits.<br>Your PB.<br>Your proof.</h2>
+        <ul><li><b>LIVE SPLITS</b><span>/ 01</span></li><li><b>LEADERBOARDS</b><span>/ 02</span></li><li><b>MEDAL CLIPS</b><span>/ 03</span></li></ul>
+      </article>
     </section>
   </main>
-
-  <footer><span>Splitsgate is an independent community project and is not affiliated with 1047 Games.</span><div class="footer-links"><a href="https://discord.gg/WHH94nyhW8" target="_blank" rel="noopener">Racers Discord</a><a href="https://github.com/cody-raves/Splitsgate/releases/latest">Release notes</a></div></footer>
-  <script src="app.js"></script>
-</body>
-</html>
+</div><script src="app.js"></script></body></html>
